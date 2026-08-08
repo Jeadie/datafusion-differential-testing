@@ -1,5 +1,4 @@
 /target
-/artifacts
-/.datafusion-differential-test
+artifacts/
+.datafusion-differential-test/
 *.db
-

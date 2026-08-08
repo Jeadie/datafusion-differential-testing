@@ -25,13 +25,10 @@ variants:
     oracle: true
     tables:
       "*": memtable
-  duckdb_shared_federated:
+  duckdb_nonfederated:
     tables:
       "*":
         provider: duck_shared
-    session:
-      extensions:
-        - type: federation
 
 # Configuration to instantiate [`TableProvider`] via `datafusion-contrib/datafusion-table-providers`. 
 providers:
@@ -43,7 +40,35 @@ providers:
 
 Then 
 ```bash
-datafusion-differential-test run example/campaign.yaml
+datafusion-differential-test run examples/four-variant/campaign.yaml
+```
+
+The runnable example under `examples/four-variant` compares an in-memory oracle
+against a federated and a non-federated variant of the same DuckDB and SQLite
+providers. Running it surfaces a real difference:
+
+```
+Completed 3 queries with 2 findings. Artifacts: examples/four-variant/artifacts/...
+  - [duckdb_nonfederated] CandidateRejected: SELECT count(1) AS n FROM orders;
+  - [sqlite_nonfederated] CandidateRejected: SELECT count(1) AS n FROM orders;
+```
+
+We can see details in the findings artifact
+```json
+{
+  "id": "finding-000000",
+  "query_id": "query-000001",
+  "candidate": "duckdb_nonfederated",
+  "kind": "candidate_rejected",
+  "message": "candidate rejected the query: Internal error: Physical input schema should be the same as the one converted from logical input schema. Differences: \n\t- Different number of fields: (physical) 3 vs (logical) 0.\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues",
+  "sql": "SELECT count(1) AS n FROM orders;\n"
+}
+```
+A datafusion bug (in `datafusion-table-providers`):
+```bash
+Internal error: Physical input schema should be the same as the one converted from logical input schema.Differences:
+  - Different number of fields: (physical) 3 vs (logical) 0.
+This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues
 ```
 
 ## Supported Datasets

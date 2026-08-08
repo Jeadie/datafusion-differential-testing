@@ -1,8 +1,0 @@
-{
-  "artifact_directory": "./examples/four-variant/artifacts/four-variant-smoke/run-1786151451805056000-32063",
-  "executed_queries": 2,
-  "findings": [],
-  "generated_queries": 2,
-  "oracle_rejections": 0,
-  "run_id": "run-1786151451805056000-32063"
-}

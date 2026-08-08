@@ -34,13 +34,10 @@ variants:
     oracle: true
     tables:
       "*": memtable
-  duckdb_shared_federated:
+  duckdb_nonfederated:
     tables:
       "*":
         provider: duck_shared
-    session:
-      extensions:
-        - type: federation
   duckdb_split_federated:
     tables:
       orders:

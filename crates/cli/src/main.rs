@@ -116,12 +116,23 @@ async fn execute(cli: Cli) -> Result<ExitCode, String> {
                 .await
                 .map_err(|error| error.to_string())?;
             match cli.format {
-                OutputFormat::Human => eprintln!(
-                    "Completed {} queries with {} findings. Artifacts: {}",
-                    report.executed_queries,
-                    report.findings.len(),
-                    report.artifact_directory.display()
-                ),
+                OutputFormat::Human => {
+                    eprintln!(
+                        "Completed {} queries with {} findings. Artifacts: {}",
+                        report.executed_queries,
+                        report.findings.len(),
+                        report.artifact_directory.display()
+                    );
+                    for finding in &report.findings {
+                        let sql: String = finding.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let sql: String = sql.chars().take(80).collect();
+                        eprintln!(
+                            "  - [{}] {:?}: {sql}",
+                            finding.candidate.as_str(),
+                            finding.kind
+                        );
+                    }
+                }
                 OutputFormat::Json => println!(
                     "{}",
                     serde_json::to_string(&report).map_err(|error| error.to_string())?
