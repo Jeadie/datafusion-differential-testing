@@ -144,3 +144,30 @@ providers:
 ```
 
 `MemTable` does not need a provider to be used in `variants`.
+
+## Federation support
+
+Variants can also be configured to support `datafusion-federation` (see repo: https://github.com/datafusion-contrib/datafusion-federation). 
+
+```yaml
+variants:
+  duckdb_federated:
+    tables:
+      # All tables in one duckdb file. Full federation pushdown.
+      "*":
+        provider: a_file_that_is_duckdb
+    session:
+      extensions:
+        - type: federation
+
+  duckdb_federated_unshared:
+    tables:
+      # Since customer and orders use different duckdb files, they wont federate together.
+      customer:
+        provider: duckdb_file_one
+      orders:
+        provider: duckdb_file_two
+    session:
+      extensions:
+        - type: federation
+```
