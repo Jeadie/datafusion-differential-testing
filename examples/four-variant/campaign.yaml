@@ -1,6 +1,5 @@
 version: 1
 name: four-variant-smoke
-oracle: oracle
 
 dataset:
   mode: fixtures
@@ -42,7 +41,8 @@ providers:
       sqlite_open: .datafusion-differential-test/sqlite.db
 
 variants:
-  oracle:
+  just_memory:
+    oracle: true
     tables:
       "*": memtable
   duckdb_shared_federated:

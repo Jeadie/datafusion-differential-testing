@@ -5,7 +5,7 @@ use datafusion::{catalog::TableProvider, physical_plan::SendableRecordBatchStrea
 
 use crate::{
     error::{Error, Result},
-    model::{RemoteTableRef, ResolvedParams, UnresolvedParams},
+    model::{ProviderLifecycle, RemoteTableRef, ResolvedParams, UnresolvedParams},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,7 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         name: &str,
         params: &ResolvedParams,
+        lifecycle: &ProviderLifecycle,
     ) -> Result<Arc<dyn ProviderInstance>>;
 }
 
@@ -49,6 +50,8 @@ pub trait ProviderInstance: Send + Sync {
     fn identity(&self) -> ProviderIdentity;
 
     fn managed(&self) -> Option<&dyn ManagedProvider>;
+
+    async fn table_exists(&self, table: &RemoteTableRef) -> Result<bool>;
 
     async fn discover(&self, selection: &TableSelection) -> Result<Vec<DiscoveredTable>>;
 

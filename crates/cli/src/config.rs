@@ -6,9 +6,9 @@ use std::{
 };
 
 use datafusion_differential_testing::{
-    CampaignSpec, FixtureSource, GeneratedQuery, Ordering, ProviderLifecycle, ProviderSpec,
-    QueryProvenance, RemoteTableRef, RunLimits, SessionExtensionSpec, SessionSpec, TableBinding,
-    VariantSpec,
+    CampaignSpec, DatasetSpec, FixtureSource, GeneratedQuery, Ordering, ProviderLifecycle,
+    ProviderSpec, QueryProvenance, RemoteTableRef, RunLimits, SessionExtensionSpec, SessionSpec,
+    TableBinding, VariantSpec,
 };
 use serde::Deserialize;
 
@@ -17,7 +17,6 @@ use serde::Deserialize;
 pub struct Config {
     pub version: u32,
     pub name: String,
-    pub oracle: String,
     pub dataset: DatasetConfig,
     #[serde(default)]
     pub campaign: CampaignConfig,
@@ -33,7 +32,10 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct DatasetConfig {
     pub mode: String,
+    #[serde(default)]
     pub fixtures: Vec<FixtureConfig>,
+    #[serde(default)]
+    pub include: Vec<String>,
     #[serde(default = "default_true")]
     pub verify_existing_unchanged: bool,
 }
@@ -48,6 +50,18 @@ pub enum FixtureConfig {
     Arrow {
         name: String,
         path: PathBuf,
+    },
+    Parquet {
+        name: String,
+        path: PathBuf,
+        #[serde(default)]
+        options: BTreeMap<String, String>,
+    },
+    Csv {
+        name: String,
+        path: PathBuf,
+        #[serde(default)]
+        options: BTreeMap<String, String>,
     },
 }
 
@@ -92,6 +106,8 @@ pub struct ProviderConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VariantConfig {
+    #[serde(default)]
+    pub oracle: bool,
     pub tables: BTreeMap<String, BindingConfig>,
     #[serde(default)]
     pub session: SessionConfig,
@@ -195,10 +211,7 @@ impl Config {
                 self.version
             ));
         }
-        if self.dataset.mode != "fixtures" {
-            return Err("dataset.mode must be `fixtures` in this developer preview".to_owned());
-        }
-        let _verify_existing_unchanged = self.dataset.verify_existing_unchanged;
+        let verify_existing_unchanged = self.dataset.verify_existing_unchanged;
         let mut fixtures = Vec::new();
         for fixture in self.dataset.fixtures {
             match fixture {
@@ -217,8 +230,46 @@ impl Config {
                     name,
                     path: resolve(base, &path)?,
                 }),
+                FixtureConfig::Parquet {
+                    name,
+                    path,
+                    options,
+                } => {
+                    if !options.is_empty() {
+                        return Err(
+                            "Parquet fixture options are not supported in version 1".to_owned()
+                        );
+                    }
+                    fixtures.push(FixtureSource::Parquet {
+                        name,
+                        path: resolve(base, &path)?,
+                    });
+                }
+                FixtureConfig::Csv {
+                    name,
+                    path,
+                    options,
+                } => fixtures.push(FixtureSource::Csv {
+                    name,
+                    path: resolve(base, &path)?,
+                    options,
+                }),
             }
         }
+        let dataset = match self.dataset.mode.as_str() {
+            "fixtures" if self.dataset.include.is_empty() => DatasetSpec::Fixtures(fixtures),
+            "fixtures" => {
+                return Err("dataset.include is valid only when mode is `oracle`".to_owned());
+            }
+            "oracle" if fixtures.is_empty() => DatasetSpec::ExistingOracle {
+                include: self.dataset.include,
+                verify_unchanged: verify_existing_unchanged,
+            },
+            "oracle" => {
+                return Err("dataset.fixtures is invalid when mode is `oracle`".to_owned());
+            }
+            value => return Err(format!("dataset.mode has unsupported value `{value}`")),
+        };
 
         let providers = self
             .providers
@@ -298,6 +349,7 @@ impl Config {
                     name.clone(),
                     VariantSpec {
                         name,
+                        oracle: variant.oracle,
                         session: SessionSpec {
                             config: variant.session.config,
                             extensions: variant
@@ -368,8 +420,7 @@ impl Config {
         }
         Ok(CampaignSpec {
             name: self.name,
-            oracle: self.oracle,
-            fixtures,
+            dataset,
             providers,
             variants,
             corpus,

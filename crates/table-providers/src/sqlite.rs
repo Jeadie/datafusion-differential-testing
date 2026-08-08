@@ -19,11 +19,12 @@ use datafusion::{
 };
 use datafusion_differential_testing::{
     DiscoveredTable, Error, LoadReport, ManagedProvider, ProviderFactory, ProviderIdentity,
-    ProviderInstance, RemoteTableRef, ResolvedParams, Result, TableSelection, UnresolvedParams,
+    ProviderInstance, ProviderLifecycle, RemoteTableRef, ResolvedParams, Result, TableSelection,
+    UnresolvedParams,
 };
 use datafusion_table_providers::sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory};
 use futures::TryStreamExt;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
@@ -57,19 +58,30 @@ impl ProviderFactory for SqliteProviderFactory {
         &self,
         name: &str,
         params: &ResolvedParams,
+        lifecycle: &ProviderLifecycle,
     ) -> Result<Arc<dyn ProviderInstance>> {
         let path = PathBuf::from(
             params
                 .get("sqlite_open")
                 .ok_or_else(|| provider_message(name, "missing `sqlite_open` parameter"))?,
         );
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+        let read_only = matches!(lifecycle, ProviderLifecycle::Existing);
+        if read_only && !path.exists() {
+            return Err(provider_message(
+                name,
+                format!("existing SQLite file `{}` does not exist", path.display()),
+            ));
         }
-        Connection::open(&path).map_err(|error| provider_error(name, error))?;
+        if !read_only {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+            }
+        }
+        open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
         Ok(Arc::new(SqliteInstance {
             name: name.to_owned(),
             path,
+            read_only,
             schemas: Mutex::new(BTreeMap::new()),
             providers: Mutex::new(BTreeMap::new()),
         }))
@@ -79,6 +91,7 @@ impl ProviderFactory for SqliteProviderFactory {
 struct SqliteInstance {
     name: String,
     path: PathBuf,
+    read_only: bool,
     schemas: Mutex<BTreeMap<RemoteTableRef, SchemaRef>>,
     providers: Mutex<BTreeMap<RemoteTableRef, Arc<dyn TableProvider>>>,
 }
@@ -93,12 +106,16 @@ impl ProviderInstance for SqliteInstance {
     }
 
     fn managed(&self) -> Option<&dyn ManagedProvider> {
-        Some(self)
+        (!self.read_only).then_some(self)
+    }
+
+    async fn table_exists(&self, table: &RemoteTableRef) -> Result<bool> {
+        self.table_exists_impl(table)
     }
 
     async fn discover(&self, _selection: &TableSelection) -> Result<Vec<DiscoveredTable>> {
-        let connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
+        let connection = open_connection(&self.path, self.read_only)
+            .map_err(|error| provider_error(&self.name, error))?;
         let mut statement = connection
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .map_err(|error| provider_error(&self.name, error))?;
@@ -121,13 +138,20 @@ impl ProviderInstance for SqliteInstance {
         if let Some(provider) = providers.get(table) {
             return Ok(Arc::clone(provider));
         }
-        let schema = self
-            .schemas
-            .lock()
-            .await
-            .get(table)
-            .cloned()
-            .ok_or_else(|| provider_message(&self.name, "table schema is unavailable"))?;
+        let cached_schema = {
+            let schemas = self.schemas.lock().await;
+            schemas.get(table).cloned()
+        };
+        let schema = if let Some(schema) = cached_schema {
+            schema
+        } else {
+            let schema = self.read_schema(table)?;
+            self.schemas
+                .lock()
+                .await
+                .insert(table.clone(), Arc::clone(&schema));
+            schema
+        };
         let path = self
             .path
             .to_str()
@@ -171,16 +195,7 @@ impl ManagedProvider for SqliteInstance {
     }
 
     async fn table_exists(&self, table: &RemoteTableRef) -> Result<bool> {
-        let connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [&table.0],
-                |row| row.get(0),
-            )
-            .map_err(|error| provider_error(&self.name, error))?;
-        Ok(count != 0)
+        self.table_exists_impl(table)
     }
 
     async fn create_table(&self, table: &RemoteTableRef, schema: SchemaRef) -> Result<()> {
@@ -254,6 +269,84 @@ impl ManagedProvider for SqliteInstance {
         self.schemas.lock().await.remove(table);
         self.providers.lock().await.remove(table);
         Ok(())
+    }
+}
+
+impl SqliteInstance {
+    fn table_exists_impl(&self, table: &RemoteTableRef) -> Result<bool> {
+        let connection = open_connection(&self.path, self.read_only)
+            .map_err(|error| provider_error(&self.name, error))?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [&table.0],
+                |row| row.get(0),
+            )
+            .map_err(|error| provider_error(&self.name, error))?;
+        Ok(count != 0)
+    }
+
+    fn read_schema(&self, table: &RemoteTableRef) -> Result<SchemaRef> {
+        let connection =
+            open_connection(&self.path, true).map_err(|error| provider_error(&self.name, error))?;
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({})", quote(&table.0)))
+            .map_err(|error| provider_error(&self.name, error))?;
+        let fields = statement
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let native_type: String = row.get(2)?;
+                let not_null: bool = row.get(3)?;
+                Ok((name, native_type, !not_null))
+            })
+            .map_err(|error| provider_error(&self.name, error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| provider_error(&self.name, error))?
+            .into_iter()
+            .map(|(name, native_type, nullable)| {
+                sqlite_arrow_type(&native_type)
+                    .map(|data_type| arrow::datatypes::Field::new(name, data_type, nullable))
+                    .map_err(|message| provider_message(&self.name, message))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if fields.is_empty() {
+            return Err(provider_message(
+                &self.name,
+                format!("SQLite table `{}` does not exist", table.0),
+            ));
+        }
+        Ok(Arc::new(Schema::new(fields)))
+    }
+}
+
+fn open_connection(path: &std::path::Path, read_only: bool) -> rusqlite::Result<Connection> {
+    if read_only {
+        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    } else {
+        Connection::open(path)
+    }
+}
+
+fn sqlite_arrow_type(native_type: &str) -> std::result::Result<DataType, String> {
+    let normalized = native_type.trim().to_ascii_uppercase();
+    if normalized.contains("INT") {
+        Ok(DataType::Int64)
+    } else if normalized.contains("CHAR")
+        || normalized.contains("CLOB")
+        || normalized.contains("TEXT")
+    {
+        Ok(DataType::Utf8)
+    } else if normalized.contains("BLOB") || normalized.is_empty() {
+        Ok(DataType::Binary)
+    } else if normalized.contains("REAL")
+        || normalized.contains("FLOA")
+        || normalized.contains("DOUB")
+    {
+        Ok(DataType::Float64)
+    } else {
+        Err(format!(
+            "SQLite declared type `{native_type}` cannot map exactly to Arrow"
+        ))
     }
 }
 

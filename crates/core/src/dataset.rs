@@ -10,7 +10,10 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_ipc::{reader::FileReader, writer::FileWriter};
-use datafusion::{prelude::SessionContext, sql::parser::DFParser};
+use datafusion::{
+    prelude::{CsvReadOptions, ParquetReadOptions, SessionContext},
+    sql::parser::DFParser,
+};
 
 use crate::{
     compare::encode_rows,
@@ -57,7 +60,6 @@ impl SnapshotBuilder {
             source,
         })?;
         let context = SessionContext::new();
-        let mut ipc_sources = Vec::new();
         for fixture in fixtures {
             match fixture {
                 FixtureSource::Sql { path } => {
@@ -69,23 +71,28 @@ impl SnapshotBuilder {
                 }
                 FixtureSource::SqlInline { sql } => execute_fixture_sql(&context, sql).await?,
                 FixtureSource::ArrowIpc { name, path } => {
-                    ipc_sources.push((name.clone(), path.clone()));
+                    register_ipc(&context, name, path)?;
+                }
+                FixtureSource::Parquet { name, path } => {
+                    context
+                        .register_parquet(
+                            name,
+                            path.to_string_lossy(),
+                            ParquetReadOptions::default(),
+                        )
+                        .await?;
+                }
+                FixtureSource::Csv {
+                    name,
+                    path,
+                    options,
+                } => {
+                    let options = csv_options(options)?;
+                    context
+                        .register_csv(name, path.to_string_lossy(), options)
+                        .await?;
                 }
             }
-        }
-
-        for (name, path) in ipc_sources {
-            let batches = read_ipc(&path)?;
-            let schema =
-                batches
-                    .first()
-                    .map(RecordBatch::schema)
-                    .ok_or_else(|| Error::Dataset {
-                        table: name.clone(),
-                        message: "Arrow IPC fixture contains no record batch".to_owned(),
-                    })?;
-            let table = datafusion::datasource::MemTable::try_new(schema, vec![batches])?;
-            context.register_table(&name, Arc::new(table))?;
         }
 
         let catalog = context
@@ -107,8 +114,9 @@ impl SnapshotBuilder {
             });
         }
 
-        let mut tables = BTreeMap::new();
-        for (index, name) in table_names.into_iter().enumerate() {
+        let mut collected = BTreeMap::new();
+        let mut schemas = BTreeMap::new();
+        for name in table_names {
             let provider = schema.table(&name).await?.ok_or_else(|| Error::Dataset {
                 table: name.clone(),
                 message: "table disappeared during snapshot creation".to_owned(),
@@ -127,16 +135,37 @@ impl SnapshotBuilder {
                     table: name.clone(),
                     message: "cannot determine table schema".to_owned(),
                 })?;
+            schemas.insert(name.clone(), schema);
+            collected.insert(name, batches);
+        }
+        self.build_from_batches(schemas, collected)
+    }
+
+    pub fn build_from_batches(
+        &self,
+        schemas: BTreeMap<String, SchemaRef>,
+        batches: BTreeMap<String, Vec<RecordBatch>>,
+    ) -> Result<DatasetSnapshot> {
+        fs::create_dir_all(&self.output_directory).map_err(|source| Error::Artifact {
+            path: self.output_directory.clone(),
+            source,
+        })?;
+        let mut tables = BTreeMap::new();
+        for (index, (name, schema)) in schemas.into_iter().enumerate() {
+            let batches = batches.get(&name).ok_or_else(|| Error::Dataset {
+                table: name.clone(),
+                message: "snapshot batches are unavailable".to_owned(),
+            })?;
             let id = TableId::new(format!("table-{index:06}"))?;
             let ipc_path = self.output_directory.join(format!("{id}.arrow"));
-            write_ipc(&ipc_path, schema.as_ref(), &batches)?;
+            write_ipc(&ipc_path, schema.as_ref(), batches)?;
             let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
-            let content_hash = logical_hash(schema.as_ref(), &batches)?;
+            let content_hash = logical_hash(schema.as_ref(), batches)?;
             tables.insert(
                 name,
                 TableSnapshot {
                     id,
-                    schema,
+                    schema: schema.clone(),
                     ipc_path,
                     row_count,
                     content_hash,
@@ -148,6 +177,58 @@ impl SnapshotBuilder {
             tables,
         })
     }
+}
+
+fn register_ipc(context: &SessionContext, name: &str, path: &Path) -> Result<()> {
+    let batches = read_ipc(path)?;
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or_else(|| Error::Dataset {
+            table: name.to_owned(),
+            message: "Arrow IPC fixture contains no record batch".to_owned(),
+        })?;
+    let table = datafusion::datasource::MemTable::try_new(schema, vec![batches])?;
+    context.register_table(name, Arc::new(table))?;
+    Ok(())
+}
+
+fn csv_options(options: &BTreeMap<String, String>) -> Result<CsvReadOptions<'static>> {
+    let mut parsed = CsvReadOptions::new();
+    for (key, value) in options {
+        match key.as_str() {
+            "has_header" => {
+                parsed = parsed.has_header(value.parse().map_err(|_| Error::Configuration {
+                    path: "dataset.fixtures[].options.has_header".to_owned(),
+                    message: "expected `true` or `false`".to_owned(),
+                })?);
+            }
+            "delimiter" => {
+                let bytes = value.as_bytes();
+                if bytes.len() != 1 {
+                    return Err(Error::Configuration {
+                        path: "dataset.fixtures[].options.delimiter".to_owned(),
+                        message: "expected one ASCII byte".to_owned(),
+                    });
+                }
+                parsed = parsed.delimiter(bytes[0]);
+            }
+            "schema_infer_max_records" => {
+                parsed.schema_infer_max_records =
+                    value.parse().map_err(|_| Error::Configuration {
+                        path: "dataset.fixtures[].options.schema_infer_max_records".to_owned(),
+                        message: "expected a positive integer".to_owned(),
+                    })?;
+            }
+            _ => {
+                return Err(Error::Configuration {
+                    path: format!("dataset.fixtures[].options.{key}"),
+                    message: "unsupported CSV option".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 async fn execute_fixture_sql(context: &SessionContext, sql: &str) -> Result<()> {
@@ -199,4 +280,54 @@ pub fn logical_hash(schema: &Schema, batches: &[RecordBatch]) -> Result<String> 
         hasher.update(&row);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builds_csv_and_parquet_fixtures() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let csv_path = temporary.path().join("people.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n2,Grace\n").expect("write CSV fixture");
+
+        let parquet_path = temporary.path().join("events.parquet");
+        let source = SessionContext::new();
+        source
+            .sql("CREATE TABLE events AS VALUES (10, 'open'), (20, 'closed')")
+            .await
+            .expect("create source table")
+            .collect()
+            .await
+            .expect("execute source table creation");
+        source
+            .sql(&format!(
+                "COPY events TO '{}' STORED AS PARQUET",
+                parquet_path.display()
+            ))
+            .await
+            .expect("plan Parquet export")
+            .collect()
+            .await
+            .expect("write Parquet fixture");
+
+        let snapshot = SnapshotBuilder::new(temporary.path().join("snapshot"))
+            .build(&[
+                FixtureSource::Csv {
+                    name: "people".to_owned(),
+                    path: csv_path,
+                    options: [("has_header".to_owned(), "true".to_owned())].into(),
+                },
+                FixtureSource::Parquet {
+                    name: "events".to_owned(),
+                    path: parquet_path,
+                },
+            ])
+            .await
+            .expect("build fixture snapshot");
+
+        assert_eq!(snapshot.tables["people"].row_count, 2);
+        assert_eq!(snapshot.tables["events"].row_count, 2);
+    }
 }

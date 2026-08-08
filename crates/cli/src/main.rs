@@ -205,7 +205,6 @@ fn runner() -> Result<CampaignRunner, String> {
 
 const INIT_CONFIG: &str = r#"version: 1
 name: four-variant-smoke
-oracle: oracle
 
 dataset:
   mode: fixtures
@@ -248,6 +247,7 @@ providers:
 
 variants:
   oracle:
+    oracle: true
     tables:
       "*": memtable
   duckdb_shared_federated:
@@ -301,3 +301,97 @@ const INIT_QUERY: &str =
     "SELECT amount, COUNT(*) AS orders FROM orders GROUP BY amount ORDER BY amount;\n";
 
 const INIT_JOIN_QUERY: &str = "SELECT o.id, c.code, o.amount FROM orders o LEFT JOIN customers c ON o.customer_id = c.id ORDER BY o.id;\n";
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_sqlite_can_supply_an_existing_oracle() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let database = temporary.path().join("retained.sqlite");
+        let seed_path = temporary.path().join("seed.yaml");
+        let seed = format!(
+            r#"version: 1
+name: seed-existing-oracle
+dataset:
+  mode: fixtures
+  fixtures:
+    - type: sql
+      sql: "CREATE TABLE items(id BIGINT, value BIGINT); INSERT INTO items VALUES (1, 10), (2, 20);"
+artifacts:
+  directory: seed-artifacts
+providers:
+  retained:
+    type: sqlite
+    lifecycle: managed
+    teardown: false
+    params:
+      sqlite_open: "{}"
+variants:
+  memtable:
+    oracle: true
+    tables:
+      "*": memtable
+  retained:
+    tables:
+      "*":
+        provider: retained
+generators:
+  - type: corpus
+    sql:
+      - "SELECT * FROM items ORDER BY id"
+"#,
+            database.display()
+        );
+        fs::write(&seed_path, seed).expect("write seed campaign");
+        let seed_report = runner()
+            .expect("create runner")
+            .run(config::load(&seed_path).expect("load seed campaign"))
+            .await
+            .expect("run seed campaign");
+        assert!(seed_report.is_success());
+
+        let campaign_path = temporary.path().join("campaign.yaml");
+        let campaign = format!(
+            r#"version: 1
+name: existing-oracle
+dataset:
+  mode: oracle
+  include:
+    - items
+artifacts:
+  directory: campaign-artifacts
+providers:
+  retained:
+    type: sqlite
+    lifecycle: existing
+    params:
+      sqlite_open: "{}"
+variants:
+  retained:
+    oracle: true
+    tables:
+      items:
+        provider: retained
+  memtable:
+    tables:
+      "*": memtable
+generators:
+  - type: corpus
+    sql:
+      - "SELECT SUM(value) AS total FROM items"
+"#,
+            database.display()
+        );
+        fs::write(&campaign_path, campaign).expect("write existing-oracle campaign");
+        let report = runner()
+            .expect("create runner")
+            .run(config::load(&campaign_path).expect("load existing-oracle campaign"))
+            .await
+            .expect("run existing-oracle campaign");
+
+        assert!(report.is_success());
+        assert_eq!(report.executed_queries, 1);
+    }
+}

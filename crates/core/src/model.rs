@@ -55,22 +55,47 @@ pub struct SessionExtensionSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VariantSpec {
     pub name: String,
+    pub oracle: bool,
     pub session: SessionSpec,
     pub tables: BTreeMap<LogicalTableName, TableBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixtureSource {
-    Sql { path: PathBuf },
-    SqlInline { sql: String },
-    ArrowIpc { name: String, path: PathBuf },
+    Sql {
+        path: PathBuf,
+    },
+    SqlInline {
+        sql: String,
+    },
+    ArrowIpc {
+        name: String,
+        path: PathBuf,
+    },
+    Parquet {
+        name: String,
+        path: PathBuf,
+    },
+    Csv {
+        name: String,
+        path: PathBuf,
+        options: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatasetSpec {
+    Fixtures(Vec<FixtureSource>),
+    ExistingOracle {
+        include: Vec<LogicalTableName>,
+        verify_unchanged: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CampaignSpec {
     pub name: String,
-    pub oracle: String,
-    pub fixtures: Vec<FixtureSource>,
+    pub dataset: DatasetSpec,
     pub providers: BTreeMap<String, ProviderSpec>,
     pub variants: BTreeMap<String, VariantSpec>,
     pub corpus: Vec<GeneratedQuery>,

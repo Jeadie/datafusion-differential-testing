@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use datafusion::{catalog::TableProvider, sql::TableReference};
 use datafusion_differential_testing::{
     DiscoveredTable, Error, LoadReport, ManagedProvider, ProviderFactory, ProviderIdentity,
-    ProviderInstance, RemoteTableRef, ResolvedParams, Result, TableSelection, UnresolvedParams,
+    ProviderInstance, ProviderLifecycle, RemoteTableRef, ResolvedParams, Result, TableSelection,
+    UnresolvedParams,
 };
 use datafusion_table_providers::{
     duckdb::DuckDBTableFactory, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
 };
-use duckdb::{AccessMode, Connection};
+use duckdb::{AccessMode, Config, Connection};
 use futures::TryStreamExt;
 use tokio::sync::Mutex;
 
@@ -35,15 +36,26 @@ impl ProviderFactory for DuckDbProviderFactory {
         &self,
         name: &str,
         params: &ResolvedParams,
+        lifecycle: &ProviderLifecycle,
     ) -> Result<Arc<dyn ProviderInstance>> {
         let path = PathBuf::from(required(params, "duckdb_open")?);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+        let read_only = matches!(lifecycle, ProviderLifecycle::Existing);
+        if read_only && !path.exists() {
+            return Err(provider_message(
+                name,
+                format!("existing DuckDB file `{}` does not exist", path.display()),
+            ));
         }
-        Connection::open(&path).map_err(|error| provider_error(name, error))?;
+        if !read_only {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+            }
+        }
+        open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
         Ok(Arc::new(DuckDbInstance {
             name: name.to_owned(),
             path,
+            read_only,
             factory: Mutex::new(None),
             providers: Mutex::new(BTreeMap::new()),
         }))
@@ -53,6 +65,7 @@ impl ProviderFactory for DuckDbProviderFactory {
 struct DuckDbInstance {
     name: String,
     path: PathBuf,
+    read_only: bool,
     factory: Mutex<Option<Arc<DuckDBTableFactory>>>,
     providers: Mutex<BTreeMap<RemoteTableRef, Arc<dyn TableProvider>>>,
 }
@@ -67,12 +80,16 @@ impl ProviderInstance for DuckDbInstance {
     }
 
     fn managed(&self) -> Option<&dyn ManagedProvider> {
-        Some(self)
+        (!self.read_only).then_some(self)
+    }
+
+    async fn table_exists(&self, table: &RemoteTableRef) -> Result<bool> {
+        self.table_exists_impl(table)
     }
 
     async fn discover(&self, _selection: &TableSelection) -> Result<Vec<DiscoveredTable>> {
-        let connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
+        let connection = open_connection(&self.path, self.read_only)
+            .map_err(|error| provider_error(&self.name, error))?;
         let mut statement = connection
             .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name")
             .map_err(|error| provider_error(&self.name, error))?;
@@ -103,8 +120,13 @@ impl ProviderInstance for DuckDbInstance {
                 let path = self.path.to_str().ok_or_else(|| {
                     provider_message(&self.name, "duckdb_open is not valid UTF-8")
                 })?;
+                let access = if self.read_only {
+                    AccessMode::ReadOnly
+                } else {
+                    AccessMode::ReadWrite
+                };
                 let pool = Arc::new(
-                    DuckDbConnectionPool::new_file(path, &AccessMode::ReadWrite)
+                    DuckDbConnectionPool::new_file(path, &access)
                         .map_err(|error| provider_error(&self.name, error))?,
                 );
                 let created = Arc::new(DuckDBTableFactory::new(pool));
@@ -132,16 +154,7 @@ impl ManagedProvider for DuckDbInstance {
     }
 
     async fn table_exists(&self, table: &RemoteTableRef) -> Result<bool> {
-        let connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
-        let count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-                [&table.0],
-                |row| row.get(0),
-            )
-            .map_err(|error| provider_error(&self.name, error))?;
-        Ok(count != 0)
+        self.table_exists_impl(table)
     }
 
     async fn create_table(&self, table: &RemoteTableRef, schema: SchemaRef) -> Result<()> {
@@ -209,6 +222,29 @@ impl ManagedProvider for DuckDbInstance {
             .map_err(|error| provider_error(&self.name, error))?;
         self.providers.lock().await.remove(table);
         Ok(())
+    }
+}
+
+impl DuckDbInstance {
+    fn table_exists_impl(&self, table: &RemoteTableRef) -> Result<bool> {
+        let connection = open_connection(&self.path, self.read_only)
+            .map_err(|error| provider_error(&self.name, error))?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+                [&table.0],
+                |row| row.get(0),
+            )
+            .map_err(|error| provider_error(&self.name, error))?;
+        Ok(count != 0)
+    }
+}
+
+fn open_connection(path: &std::path::Path, read_only: bool) -> duckdb::Result<Connection> {
+    if read_only {
+        Connection::open_with_flags(path, Config::default().access_mode(AccessMode::ReadOnly)?)
+    } else {
+        Connection::open(path)
     }
 }
 
