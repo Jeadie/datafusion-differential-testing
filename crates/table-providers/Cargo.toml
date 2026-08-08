@@ -1,0 +1,28 @@
+[package]
+name = "datafusion-differential-testing-table-providers"
+description = "Provider adapters for DataFusion differential testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+duckdb = ["dep:duckdb", "datafusion-table-providers/duckdb", "datafusion-table-providers/duckdb-federation"]
+sqlite = ["dep:rusqlite", "datafusion-table-providers/sqlite"]
+all-providers = ["duckdb", "sqlite"]
+
+[dependencies]
+async-trait.workspace = true
+arrow.workspace = true
+datafusion.workspace = true
+datafusion-differential-testing.workspace = true
+datafusion-table-providers.workspace = true
+duckdb = { workspace = true, optional = true }
+futures.workspace = true
+rusqlite = { workspace = true, optional = true }
+tokio.workspace = true
+
+[lints]
+workspace = true

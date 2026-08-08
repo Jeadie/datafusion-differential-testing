@@ -1,0 +1,39 @@
+[package]
+name = "datafusion-differential-test"
+description = "Configuration-driven DataFusion differential testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "datafusion-differential-test"
+path = "src/main.rs"
+
+[features]
+default = ["corpus", "duckdb", "sqlite", "federation"]
+corpus = []
+random = []
+duckdb = ["dep:datafusion-differential-testing-table-providers", "datafusion-differential-testing-table-providers/duckdb"]
+sqlite = ["dep:datafusion-differential-testing-table-providers", "datafusion-differential-testing-table-providers/sqlite"]
+federation = ["dep:datafusion-differential-testing-federation"]
+all-providers = ["duckdb", "sqlite"]
+
+[dependencies]
+clap.workspace = true
+datafusion-differential-testing.workspace = true
+datafusion-differential-testing-federation = { path = "../federation", optional = true }
+datafusion-differential-testing-table-providers = { path = "../table-providers", optional = true }
+humantime.workspace = true
+glob.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

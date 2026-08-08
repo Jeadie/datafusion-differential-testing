@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/table-providers",
+    "crates/federation",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/datafusion-contrib/datafusion-differential-testing"
+
+[workspace.dependencies]
+async-trait = "0.1"
+blake3 = "1"
+clap = { version = "4.5", features = ["derive"] }
+arrow = "=58.3.0"
+arrow-ipc = "=58.3.0"
+arrow-row = "=58.3.0"
+datafusion = "=54.1.0"
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0cb3781608b89f40c6585618ec3071f83345671a", features = ["sql"] }
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ccdc1aaae359b9b4066fd4fbad19638b9176d5fa", default-features = false }
+datafusion-differential-testing = { path = "crates/core" }
+duckdb = "1.10503"
+futures = "0.3"
+glob = "0.3"
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = "0.40"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1.41", features = ["fs", "macros", "rt-multi-thread", "signal", "time"] }
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+
+[patch.crates-io]
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "4387e69564d85a411802e0782bc503b53577c50d" }
+rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "3f98225d35735a61a5875d356774d246a8b0c037" }
+tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

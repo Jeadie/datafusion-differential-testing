@@ -1,0 +1,16 @@
+[package]
+name = "datafusion-differential-testing-federation"
+description = "Federation session extension for DataFusion differential testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+datafusion.workspace = true
+datafusion-federation.workspace = true
+datafusion-differential-testing.workspace = true
+
+[lints]
+workspace = true

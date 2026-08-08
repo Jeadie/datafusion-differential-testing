@@ -1,0 +1,5 @@
+/target
+/artifacts
+/.datafusion-differential-test
+*.db
+

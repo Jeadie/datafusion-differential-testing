@@ -1,0 +1,72 @@
+version: 1
+name: four-variant-smoke
+oracle: oracle
+
+dataset:
+  mode: fixtures
+  fixtures:
+    - type: sql
+      path: fixtures/data.sql
+
+campaign:
+  max_queries: 100
+  query_timeout: 30s
+
+artifacts:
+  directory: artifacts
+
+providers:
+  duck_shared:
+    type: duckdb
+    lifecycle: managed
+    teardown: true
+    params:
+      duckdb_open: .datafusion-differential-test/duck-shared.db
+  duck_orders:
+    type: duckdb
+    lifecycle: managed
+    teardown: true
+    params:
+      duckdb_open: .datafusion-differential-test/duck-orders.db
+  duck_customers:
+    type: duckdb
+    lifecycle: managed
+    teardown: true
+    params:
+      duckdb_open: .datafusion-differential-test/duck-customers.db
+  sqlite:
+    type: sqlite
+    lifecycle: managed
+    teardown: true
+    params:
+      sqlite_open: .datafusion-differential-test/sqlite.db
+
+variants:
+  oracle:
+    tables:
+      "*": memtable
+  duckdb_shared_federated:
+    tables:
+      "*":
+        provider: duck_shared
+    session:
+      extensions:
+        - type: federation
+  duckdb_split_federated:
+    tables:
+      orders:
+        provider: duck_orders
+      customers:
+        provider: duck_customers
+    session:
+      extensions:
+        - type: federation
+  sqlite_nonfederated:
+    tables:
+      "*":
+        provider: sqlite
+
+generators:
+  - type: corpus
+    paths:
+      - queries/*.sql

@@ -1,0 +1,15 @@
+{
+  "id": "dataset-000001",
+  "tables": {
+    "customers": {
+      "row_count": 2,
+      "content_hash": "169ab8a4f97b080bf328abf6d2702a46a69f4352e59a3666dc0f7ef132a0802f",
+      "ipc_path": "./examples/four-variant/artifacts/four-variant-smoke/run-1786151451805056000-32063/dataset/table-000000.arrow"
+    },
+    "orders": {
+      "row_count": 4,
+      "content_hash": "85898ea09e07a1c2087d393e98d9249de54de060524c2859e3aaed99991668f5",
+      "ipc_path": "./examples/four-variant/artifacts/four-variant-smoke/run-1786151451805056000-32063/dataset/table-000001.arrow"
+    }
+  }
+}
