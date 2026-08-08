@@ -7,8 +7,8 @@ use std::{
 
 use datafusion_differential_testing::{
     CampaignSpec, DatasetSpec, FixtureSource, GeneratedQuery, Ordering, ProviderLifecycle,
-    ProviderSpec, QueryProvenance, RemoteTableRef, RunLimits, SessionExtensionSpec, SessionSpec,
-    TableBinding, TableSource, VariantSpec,
+    ProviderSpec, QueryProvenance, RandomGeneratorSpec, RemoteTableRef, RunLimits,
+    SessionExtensionSpec, SessionSpec, TableBinding, TableSource, VariantSpec,
 };
 use serde::Deserialize;
 
@@ -151,6 +151,10 @@ pub enum GeneratorConfig {
         paths: Vec<String>,
         #[serde(default)]
         sql: Vec<String>,
+    },
+    Random {
+        seed: Option<u64>,
+        count: usize,
     },
 }
 
@@ -312,8 +316,26 @@ impl Config {
             .collect::<Result<_, String>>()?;
 
         let mut corpus = Vec::new();
+        let mut random_generators = Vec::new();
         for generator in self.generators {
             match generator {
+                GeneratorConfig::Random { seed, count } => {
+                    if count == 0 {
+                        return Err("random generator `count` must be positive".to_owned());
+                    }
+                    // No seed => exploratory mode: pick a fresh seed each run and
+                    // let the generator use the noisier query shapes. An explicit
+                    // seed keeps the run reproducible and sound.
+                    let (seed, nondeterministic) = match seed {
+                        Some(seed) => (seed, false),
+                        None => (entropy_seed(), true),
+                    };
+                    random_generators.push(RandomGeneratorSpec {
+                        seed,
+                        count,
+                        nondeterministic,
+                    });
+                }
                 GeneratorConfig::Corpus { paths, sql } => {
                     corpus.extend(sql.into_iter().map(|sql| GeneratedQuery::corpus(sql, None)));
                     for pattern in paths {
@@ -367,6 +389,7 @@ impl Config {
             providers,
             variants,
             corpus,
+            random_generators,
             limits: RunLimits {
                 max_queries: self.campaign.max_queries.unwrap_or(defaults.max_queries),
                 max_findings: self.campaign.max_findings.unwrap_or(defaults.max_findings),
@@ -531,6 +554,18 @@ fn resolve_environment(value: &str) -> Result<String, String> {
 
 const fn default_true() -> bool {
     true
+}
+
+/// A best-effort non-deterministic seed for when the user omits one. The value
+/// is recorded in each generated query's provenance, so a run remains
+/// reproducible after the fact by pinning this seed.
+fn entropy_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 const fn default_version() -> u32 {
@@ -700,6 +735,82 @@ providers:
         );
         let spec = spec_from(&yaml);
         assert_eq!(spec.name, "campaign");
+    }
+
+    #[test]
+    fn random_generator_parses_seed_and_count() {
+        let yaml = r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: random
+    seed: 7
+    count: 42
+"#;
+        let spec = spec_from(yaml);
+        assert!(spec.corpus.is_empty());
+        assert_eq!(spec.random_generators.len(), 1);
+        assert_eq!(spec.random_generators[0].seed, 7);
+        assert_eq!(spec.random_generators[0].count, 42);
+        // An explicit seed selects the reproducible, sound mode.
+        assert!(!spec.random_generators[0].nondeterministic);
+    }
+
+    #[test]
+    fn random_generator_without_seed_is_nondeterministic() {
+        let yaml = r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: random
+    count: 10
+"#;
+        let spec = spec_from(yaml);
+        assert!(spec.random_generators[0].nondeterministic);
+    }
+
+    #[test]
+    fn random_generator_rejects_zero_count() {
+        let yaml = r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: random
+    count: 0
+"#;
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
+        let config: Config = serde_yaml::from_value(value).expect("valid config");
+        let error = config
+            .into_spec(Path::new("/base"))
+            .expect_err("zero count must fail");
+        assert!(error.contains("`count` must be positive"));
     }
 
     #[test]

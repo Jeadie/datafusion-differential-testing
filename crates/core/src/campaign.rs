@@ -98,8 +98,11 @@ impl CampaignRunner {
             return configuration("variants", "define at least two variants");
         }
         let oracle_name = oracle_name(spec)?;
-        if spec.corpus.is_empty() {
-            return configuration("generators", "define at least one corpus query");
+        if spec.corpus.is_empty() && spec.random_generators.is_empty() {
+            return configuration(
+                "generators",
+                "define at least one corpus query or random generator",
+            );
         }
         if let DatasetSpec::Tables { sources, .. } = &spec.dataset {
             if sources.is_empty() {
@@ -283,6 +286,12 @@ impl CampaignRunner {
             .filter(|(name, _)| *name != &oracle_name)
             .collect();
 
+        // Schema-aware generators run here, once the canonical snapshot (and thus
+        // every table schema) exists. Generated queries follow the fixed corpus.
+        let generated = generate_random_queries(&spec, &snapshot);
+        let all_queries: Vec<&crate::GeneratedQuery> =
+            spec.corpus.iter().chain(generated.iter()).collect();
+
         let mut report = RunReport {
             run_id,
             artifact_directory: run_directory,
@@ -291,7 +300,12 @@ impl CampaignRunner {
             oracle_rejections: 0,
             findings: Vec::new(),
         };
-        for (query_index, query) in spec.corpus.iter().take(spec.limits.max_queries).enumerate() {
+        for (query_index, query) in all_queries
+            .iter()
+            .copied()
+            .take(spec.limits.max_queries)
+            .enumerate()
+        {
             report.generated_queries += 1;
             let query_id = QueryId::new(format!("query-{query_index:06}"))?;
             let oracle_outcome = execute_query(oracle, query, spec.limits.query_timeout).await;
@@ -560,6 +574,31 @@ impl CampaignRunner {
 }
 
 type ManagedTarget = (String, RemoteTableRef, String);
+
+fn generate_random_queries(
+    spec: &CampaignSpec,
+    snapshot: &DatasetSnapshot,
+) -> Vec<crate::GeneratedQuery> {
+    if spec.random_generators.is_empty() {
+        return Vec::new();
+    }
+    let generator = crate::SchemaAwareGenerator::new(
+        snapshot
+            .tables
+            .iter()
+            .map(|(name, table)| (name.as_str(), &table.schema)),
+    );
+    spec.random_generators
+        .iter()
+        .flat_map(|generator_spec| {
+            generator.generate(
+                generator_spec.seed,
+                generator_spec.count,
+                generator_spec.nondeterministic,
+            )
+        })
+        .collect()
+}
 
 fn oracle_name(spec: &CampaignSpec) -> Result<&str> {
     let names: Vec<_> = spec
@@ -930,6 +969,7 @@ mod tests {
             providers: BTreeMap::new(),
             variants,
             corpus: vec![GeneratedQuery::corpus("SELECT * FROM t", None)],
+            random_generators: Vec::new(),
             limits: RunLimits::default(),
             artifacts: PathBuf::from("artifacts"),
         }
@@ -979,6 +1019,7 @@ mod tests {
                         provided_id: None,
                     },
                 }],
+                random_generators: Vec::new(),
                 limits: RunLimits::default(),
                 artifacts: PathBuf::from(temporary.path()),
             })

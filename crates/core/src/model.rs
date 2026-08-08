@@ -117,8 +117,28 @@ pub struct CampaignSpec {
     pub providers: BTreeMap<String, ProviderSpec>,
     pub variants: BTreeMap<String, VariantSpec>,
     pub corpus: Vec<GeneratedQuery>,
+    /// Schema-aware generators materialized after the dataset snapshot exists.
+    pub random_generators: Vec<RandomGeneratorSpec>,
     pub limits: RunLimits,
     pub artifacts: PathBuf,
+}
+
+/// Configuration for the schema-aware random query generator.
+///
+/// Queries are produced from the canonical dataset schema once the snapshot is
+/// built, so this spec only carries the (resolved) seed and how many queries to
+/// emit.
+///
+/// When the user omits a seed, the CLI resolves a random one and sets
+/// `nondeterministic`, which lets the generator emit the noisier shapes
+/// (`LIMIT`, float aggregates) that can produce legitimate-but-not-a-bug
+/// oracle/candidate differences. With an explicit seed the run is both
+/// reproducible and sound (those shapes are suppressed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RandomGeneratorSpec {
+    pub seed: u64,
+    pub count: usize,
+    pub nondeterministic: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

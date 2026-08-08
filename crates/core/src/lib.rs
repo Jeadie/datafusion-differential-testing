@@ -9,6 +9,7 @@ pub mod generator;
 pub mod id;
 pub mod model;
 pub mod provider;
+pub mod random_generator;
 pub mod session;
 
 pub use artifact::{ArtifactStore, FileArtifactStore};
@@ -17,6 +18,7 @@ pub use compare::{Comparator, StrictComparator};
 pub use dataset::{DatasetSnapshot, SnapshotBuilder, TableSnapshot};
 pub use error::{Error, Result};
 pub use generator::{CorpusGenerator, GenerationStep, QueryGenerator};
+pub use random_generator::SchemaAwareGenerator;
 pub use id::*;
 pub use model::*;
 pub use provider::*;
