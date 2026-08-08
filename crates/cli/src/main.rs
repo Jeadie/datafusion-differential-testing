@@ -203,14 +203,11 @@ fn runner() -> Result<CampaignRunner, String> {
         .with_extension_registry(extensions))
 }
 
-const INIT_CONFIG: &str = r#"version: 1
-name: four-variant-smoke
+const INIT_CONFIG: &str = r#"name: four-variant-smoke
 
 dataset:
-  mode: fixtures
-  fixtures:
-    - type: sql
-      path: fixtures/data.sql
+  paths:
+    - fixtures/data.sql
 
 campaign:
   max_queries: 100
@@ -222,26 +219,18 @@ artifacts:
 providers:
   duck_shared:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-shared.db
   duck_orders:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-orders.db
   duck_customers:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-customers.db
   sqlite:
     type: sqlite
-    lifecycle: managed
-    teardown: true
     params:
       sqlite_open: .datafusion-differential-test/sqlite.db
 
@@ -310,24 +299,26 @@ mod tests {
     async fn retained_sqlite_can_supply_an_existing_oracle() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let database = temporary.path().join("retained.sqlite");
+        let fixture_path = temporary.path().join("items.sql");
+        fs::write(
+            &fixture_path,
+            "CREATE TABLE items(id BIGINT, value BIGINT); INSERT INTO items VALUES (1, 10), (2, 20);",
+        )
+        .expect("write seed fixture");
         let seed_path = temporary.path().join("seed.yaml");
         let seed = format!(
-            r#"version: 1
-name: seed-existing-oracle
+            r#"name: seed-existing-oracle
 dataset:
-  mode: fixtures
-  fixtures:
-    - type: sql
-      sql: "CREATE TABLE items(id BIGINT, value BIGINT); INSERT INTO items VALUES (1, 10), (2, 20);"
+  paths:
+    - "{fixture}"
 artifacts:
   directory: seed-artifacts
 providers:
   retained:
     type: sqlite
-    lifecycle: managed
     teardown: false
     params:
-      sqlite_open: "{}"
+      sqlite_open: "{database}"
 variants:
   memtable:
     oracle: true
@@ -342,7 +333,8 @@ generators:
     sql:
       - "SELECT * FROM items ORDER BY id"
 "#,
-            database.display()
+            fixture = fixture_path.display(),
+            database = database.display(),
         );
         fs::write(&seed_path, seed).expect("write seed campaign");
         let seed_report = runner()
@@ -354,12 +346,9 @@ generators:
 
         let campaign_path = temporary.path().join("campaign.yaml");
         let campaign = format!(
-            r#"version: 1
-name: existing-oracle
+            r#"name: existing-oracle
 dataset:
-  mode: oracle
-  include:
-    - items
+  variant: retained
 artifacts:
   directory: campaign-artifacts
 providers:
@@ -372,7 +361,7 @@ variants:
   retained:
     oracle: true
     tables:
-      items:
+      "*":
         provider: retained
   memtable:
     tables:

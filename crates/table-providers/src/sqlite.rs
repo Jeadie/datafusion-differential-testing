@@ -37,12 +37,7 @@ impl ProviderFactory for SqliteProviderFactory {
     }
 
     fn validate(&self, params: &UnresolvedParams) -> Result<()> {
-        if !params.contains_key("sqlite_open") {
-            return Err(provider_message(
-                "sqlite",
-                "missing `sqlite_open` parameter",
-            ));
-        }
+        // A missing `sqlite_open` key means the provider runs against an in-memory database.
         for key in params.keys() {
             if key != "sqlite_open" {
                 return Err(provider_message(
@@ -60,38 +55,65 @@ impl ProviderFactory for SqliteProviderFactory {
         params: &ResolvedParams,
         lifecycle: &ProviderLifecycle,
     ) -> Result<Arc<dyn ProviderInstance>> {
-        let path = PathBuf::from(
-            params
-                .get("sqlite_open")
-                .ok_or_else(|| provider_message(name, "missing `sqlite_open` parameter"))?,
-        );
         let read_only = matches!(lifecycle, ProviderLifecycle::Existing);
-        if read_only && !path.exists() {
-            return Err(provider_message(
-                name,
-                format!("existing SQLite file `{}` does not exist", path.display()),
-            ));
-        }
-        if !read_only {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+        let (target, guard) = match params.get("sqlite_open") {
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if read_only && !path.exists() {
+                    return Err(provider_message(
+                        name,
+                        format!("existing SQLite file `{}` does not exist", path.display()),
+                    ));
+                }
+                if !read_only {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|error| provider_error(name, error))?;
+                    }
+                }
+                open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
+                (SqliteTarget::File(path), None)
             }
-        }
-        open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
+            None => {
+                if read_only {
+                    return Err(provider_message(
+                        name,
+                        "existing SQLite provider requires a `sqlite_open` path; an in-memory database has no backing file",
+                    ));
+                }
+                // A shared-cache in-memory database is dropped when its last
+                // connection closes. Keep a guard connection open for the whole
+                // life of the instance and derive a stable name from the
+                // provider so every connection targets the same database.
+                let uri = memory_uri(name);
+                let guard =
+                    open_memory(&uri).map_err(|error| provider_error(name, error))?;
+                (SqliteTarget::Memory(uri), Some(guard))
+            }
+        };
         Ok(Arc::new(SqliteInstance {
             name: name.to_owned(),
-            path,
+            target,
             read_only,
+            _guard: Mutex::new(guard),
             schemas: Mutex::new(BTreeMap::new()),
             providers: Mutex::new(BTreeMap::new()),
         }))
     }
 }
 
+enum SqliteTarget {
+    File(PathBuf),
+    Memory(String),
+}
+
 struct SqliteInstance {
     name: String,
-    path: PathBuf,
+    target: SqliteTarget,
     read_only: bool,
+    /// Held open so a shared-cache in-memory database survives for the whole
+    /// life of the instance. Unused for file-backed instances.
+    _guard: Mutex<Option<Connection>>,
     schemas: Mutex<BTreeMap<RemoteTableRef, SchemaRef>>,
     providers: Mutex<BTreeMap<RemoteTableRef, Arc<dyn TableProvider>>>,
 }
@@ -114,8 +136,7 @@ impl ProviderInstance for SqliteInstance {
     }
 
     async fn discover(&self, _selection: &TableSelection) -> Result<Vec<DiscoveredTable>> {
-        let connection = open_connection(&self.path, self.read_only)
-            .map_err(|error| provider_error(&self.name, error))?;
+        let connection = self.open(self.read_only)?;
         let mut statement = connection
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .map_err(|error| provider_error(&self.name, error))?;
@@ -152,19 +173,21 @@ impl ProviderInstance for SqliteInstance {
                 .insert(table.clone(), Arc::clone(&schema));
             schema
         };
-        let path = self
-            .path
-            .to_str()
-            .ok_or_else(|| provider_message(&self.name, "sqlite_open is not valid UTF-8"))?;
+        let path = self.connection_string()?;
         let df_schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
+        // Point the read factory at the same file/URI (in file mode) so a
+        // shared-cache in-memory database resolves to the one database this
+        // instance uses for DDL and loads. The default rusqlite open flags
+        // enable URI handling, so the `file:...?mode=memory&cache=shared` URI
+        // is honoured here too.
         let command = CreateExternalTable::builder(
             TableReference::bare(table.0.as_str()),
-            path,
+            &path,
             "SQLITE",
             df_schema,
         )
         .with_options(HashMap::from([
-            ("file".to_owned(), path.to_owned()),
+            ("file".to_owned(), path.clone()),
             ("mode".to_owned(), "file".to_owned()),
         ]))
         .build();
@@ -213,10 +236,8 @@ impl ManagedProvider for SqliteInstance {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        Connection::open(&self.path)
-            .and_then(|connection| {
-                connection.execute_batch(&format!("CREATE TABLE {} ({columns})", quote(&table.0)))
-            })
+        self.open(false)?
+            .execute_batch(&format!("CREATE TABLE {} ({columns})", quote(&table.0)))
             .map_err(|error| provider_error(&self.name, error))?;
         self.schemas.lock().await.insert(table.clone(), schema);
         Ok(())
@@ -231,8 +252,7 @@ impl ManagedProvider for SqliteInstance {
             .try_collect::<Vec<_>>()
             .await
             .map_err(|error| provider_error(&self.name, error))?;
-        let mut connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
+        let mut connection = self.open(false)?;
         let transaction = connection
             .transaction()
             .map_err(|error| provider_error(&self.name, error))?;
@@ -261,10 +281,8 @@ impl ManagedProvider for SqliteInstance {
     }
 
     async fn drop_table(&self, table: &RemoteTableRef) -> Result<()> {
-        Connection::open(&self.path)
-            .and_then(|connection| {
-                connection.execute_batch(&format!("DROP TABLE {}", quote(&table.0)))
-            })
+        self.open(false)?
+            .execute_batch(&format!("DROP TABLE {}", quote(&table.0)))
             .map_err(|error| provider_error(&self.name, error))?;
         self.schemas.lock().await.remove(table);
         self.providers.lock().await.remove(table);
@@ -273,9 +291,36 @@ impl ManagedProvider for SqliteInstance {
 }
 
 impl SqliteInstance {
+    /// Open a connection to this instance's backing database.
+    ///
+    /// For an in-memory instance every connection targets the same shared-cache
+    /// URI, so all operations observe the same database. `read_only` is honoured
+    /// only for file-backed instances; an in-memory instance is always managed.
+    fn open(&self, read_only: bool) -> Result<Connection> {
+        match &self.target {
+            SqliteTarget::File(path) => {
+                open_connection(path, read_only).map_err(|error| provider_error(&self.name, error))
+            }
+            SqliteTarget::Memory(uri) => {
+                open_memory(uri).map_err(|error| provider_error(&self.name, error))
+            }
+        }
+    }
+
+    /// The connection string handed to the read factory: a file path or the
+    /// shared-cache in-memory URI.
+    fn connection_string(&self) -> Result<String> {
+        match &self.target {
+            SqliteTarget::File(path) => path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| provider_message(&self.name, "sqlite_open is not valid UTF-8")),
+            SqliteTarget::Memory(uri) => Ok(uri.clone()),
+        }
+    }
+
     fn table_exists_impl(&self, table: &RemoteTableRef) -> Result<bool> {
-        let connection = open_connection(&self.path, self.read_only)
-            .map_err(|error| provider_error(&self.name, error))?;
+        let connection = self.open(self.read_only)?;
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -287,8 +332,7 @@ impl SqliteInstance {
     }
 
     fn read_schema(&self, table: &RemoteTableRef) -> Result<SchemaRef> {
-        let connection =
-            open_connection(&self.path, true).map_err(|error| provider_error(&self.name, error))?;
+        let connection = self.open(true)?;
         let mut statement = connection
             .prepare(&format!("PRAGMA table_info({})", quote(&table.0)))
             .map_err(|error| provider_error(&self.name, error))?;
@@ -325,6 +369,35 @@ fn open_connection(path: &std::path::Path, read_only: bool) -> rusqlite::Result<
     } else {
         Connection::open(path)
     }
+}
+
+/// Build a stable shared-cache in-memory URI for a provider. Every connection
+/// opened with this URI targets the same in-memory database while at least one
+/// connection stays open.
+fn memory_uri(name: &str) -> String {
+    format!("file:ddt_memdb_{}?mode=memory&cache=shared", safe_name(name))
+}
+
+fn open_memory(uri: &str) -> rusqlite::Result<Connection> {
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+}
+
+fn safe_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn sqlite_arrow_type(native_type: &str) -> std::result::Result<DataType, String> {
@@ -403,5 +476,97 @@ fn provider_message(name: &str, message: impl Into<String>) -> Error {
     Error::Provider {
         provider: name.to_owned(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::Field,
+        record_batch::RecordBatch,
+    };
+    use datafusion::{physical_plan::stream::RecordBatchStreamAdapter, prelude::SessionContext};
+
+    fn sample_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn in_memory_roundtrip_shares_one_database() {
+        let factory = SqliteProviderFactory;
+        let params = ResolvedParams::new();
+        let lifecycle = ProviderLifecycle::Managed { teardown: true };
+        let instance = factory
+            .connect("in_memory_sqlite", &params, &lifecycle)
+            .await
+            .expect("connect in-memory instance");
+        let managed = instance.managed().expect("managed provider");
+        let schema = sample_schema();
+        let table = RemoteTableRef("people".to_owned());
+
+        managed
+            .create_table(&table, Arc::clone(&schema))
+            .await
+            .expect("create table");
+        assert!(managed.table_exists(&table).await.expect("table exists"));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+            ],
+        )
+        .expect("record batch");
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let report = managed.load(&table, stream).await.expect("load rows");
+        assert_eq!(report.rows_loaded, 3);
+
+        let provider = instance
+            .table_provider(&table)
+            .await
+            .expect("table provider");
+        let ctx = SessionContext::new();
+        ctx.register_table("people", provider)
+            .expect("register table");
+        let results = ctx
+            .sql("SELECT id, name FROM people ORDER BY id")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("run query");
+        let rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn in_memory_rejects_existing_lifecycle() {
+        let factory = SqliteProviderFactory;
+        let params = ResolvedParams::new();
+        let result = factory
+            .connect("in_memory_sqlite", &params, &ProviderLifecycle::Existing)
+            .await;
+        assert!(matches!(result, Err(Error::Provider { .. })));
+    }
+
+    #[test]
+    fn validate_accepts_empty_params_and_rejects_unknown() {
+        let factory = SqliteProviderFactory;
+        assert!(factory.validate(&UnresolvedParams::new()).is_ok());
+        let mut params = UnresolvedParams::new();
+        params.insert("sqlite_open".to_owned(), "db.sqlite".to_owned());
+        assert!(factory.validate(&params).is_ok());
+        let mut unknown = UnresolvedParams::new();
+        unknown.insert("nope".to_owned(), "x".to_owned());
+        assert!(factory.validate(&unknown).is_err());
     }
 }

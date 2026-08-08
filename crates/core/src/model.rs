@@ -83,11 +83,29 @@ pub enum FixtureSource {
     },
 }
 
+/// A single canonical table source within a `DatasetSpec::Tables` dataset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableSource {
+    /// A fixture: an SQL file/inline script (may define many tables) or one named
+    /// file table (Arrow IPC, Parquet or CSV).
+    Fixture(FixtureSource),
+    /// A single logical table sourced from another variant's provider.
+    FromVariant {
+        table: LogicalTableName,
+        variant: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatasetSpec {
-    Fixtures(Vec<FixtureSource>),
-    ExistingOracle {
-        include: Vec<LogicalTableName>,
+    /// Canonical tables assembled from fixtures and/or single tables sourced from a variant.
+    Tables {
+        sources: Vec<TableSource>,
+        verify_unchanged: bool,
+    },
+    /// All tables discovered from one variant's provider(s).
+    Variant {
+        variant: String,
         verify_unchanged: bool,
     },
 }

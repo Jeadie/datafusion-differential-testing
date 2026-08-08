@@ -19,9 +19,9 @@ use crate::{
     dataset::{logical_hash, SnapshotBuilder},
     error::{Error, Result},
     CampaignSpec, Comparison, DatasetSnapshot, DatasetSpec, ExecutionError, Finding, FindingId,
-    ProviderInstance, ProviderLifecycle, ProviderRegistry, QueryId, QueryOutcome, QueryResult,
-    RemoteTableRef, RunId, RunManifest, SessionExtensionRegistry, TableBinding, VariantId,
-    VariantSpec,
+    LogicalTableName, ProviderInstance, ProviderLifecycle, ProviderRegistry, QueryId, QueryOutcome,
+    QueryResult, RemoteTableRef, RunId, RunManifest, SessionExtensionRegistry, TableBinding,
+    TableSelection, TableSource, VariantId, VariantSpec,
 };
 use futures::stream;
 
@@ -101,14 +101,10 @@ impl CampaignRunner {
         if spec.corpus.is_empty() {
             return configuration("generators", "define at least one corpus query");
         }
-        match &spec.dataset {
-            DatasetSpec::Fixtures(fixtures) if fixtures.is_empty() => {
-                return configuration("dataset.fixtures", "define at least one fixture");
+        if let DatasetSpec::Tables { sources, .. } = &spec.dataset {
+            if sources.is_empty() {
+                return configuration("dataset", "define at least one table source");
             }
-            DatasetSpec::ExistingOracle { include, .. } if include.is_empty() => {
-                return configuration("dataset.include", "select at least one oracle table");
-            }
-            _ => {}
         }
         for (name, provider) in &spec.providers {
             if &provider.name != name {
@@ -169,29 +165,66 @@ impl CampaignRunner {
                 }
             }
         }
-        if let DatasetSpec::ExistingOracle { include, .. } = &spec.dataset {
-            let oracle = &spec.variants[oracle_name];
-            if oracle.tables.contains_key("*") {
-                return configuration(
-                    &format!("variants.{oracle_name}.tables"),
-                    "an existing oracle requires explicit table bindings",
-                );
+        match &spec.dataset {
+            DatasetSpec::Tables { sources, .. } => {
+                for source in sources {
+                    let TableSource::FromVariant { table, variant } = source else {
+                        continue;
+                    };
+                    let Some(variant_spec) = spec.variants.get(variant) else {
+                        return configuration(
+                            "dataset",
+                            &format!("table `{table}` references unknown variant `{variant}`"),
+                        );
+                    };
+                    let binding = variant_spec
+                        .tables
+                        .get(table)
+                        .or_else(|| variant_spec.tables.get("*"));
+                    let Some(TableBinding::Provider { instance, .. }) = binding else {
+                        return configuration(
+                            &format!("variants.{variant}.tables.{table}"),
+                            "a variant-sourced table must bind a provider",
+                        );
+                    };
+                    if !spec.providers.contains_key(instance) {
+                        return configuration(
+                            &format!("variants.{variant}.tables.{table}"),
+                            &format!("provider `{instance}` is not defined"),
+                        );
+                    }
+                }
             }
-            for table in include {
-                let Some(TableBinding::Provider { instance, .. }) = oracle.tables.get(table) else {
+            DatasetSpec::Variant { variant, .. } => {
+                if variant.as_str() != oracle_name {
                     return configuration(
-                        &format!("variants.{oracle_name}.tables.{table}"),
-                        "an existing oracle table must bind an existing provider",
+                        "dataset.variant",
+                        "a whole-variant dataset must reference the oracle variant",
                     );
-                };
-                if !matches!(
-                    spec.providers[instance].lifecycle,
-                    ProviderLifecycle::Existing
-                ) {
+                }
+                let oracle = &spec.variants[oracle_name];
+                if oracle.tables.is_empty() {
                     return configuration(
-                        &format!("providers.{instance}.lifecycle"),
-                        "an existing oracle requires lifecycle `existing`",
+                        &format!("variants.{oracle_name}.tables"),
+                        "the oracle variant defines no table bindings",
                     );
+                }
+                for (table, binding) in &oracle.tables {
+                    let TableBinding::Provider { instance, .. } = binding else {
+                        return configuration(
+                            &format!("variants.{oracle_name}.tables.{table}"),
+                            "an existing oracle table must bind an existing provider",
+                        );
+                    };
+                    if !matches!(
+                        spec.providers[instance].lifecycle,
+                        ProviderLifecycle::Existing
+                    ) {
+                        return configuration(
+                            &format!("providers.{instance}.lifecycle"),
+                            "an existing oracle requires lifecycle `existing`",
+                        );
+                    }
                 }
             }
         }
@@ -223,18 +256,9 @@ impl CampaignRunner {
         })?;
         let connected = self.connect_providers(&spec).await?;
         let snapshot_builder = SnapshotBuilder::new(run_directory.join("dataset"));
-        let snapshot = match &spec.dataset {
-            DatasetSpec::Fixtures(fixtures) => snapshot_builder.build(fixtures).await?,
-            DatasetSpec::ExistingOracle { include, .. } => {
-                self.snapshot_existing_oracle(
-                    &spec.variants[&oracle_name],
-                    include,
-                    &connected,
-                    &snapshot_builder,
-                )
-                .await?
-            }
-        };
+        let snapshot = self
+            .build_snapshot(&spec, &connected, &snapshot_builder)
+            .await?;
         store.write_dataset_manifest(&snapshot)?;
         verify_existing_targets(&spec, &snapshot, &connected).await?;
         let owned = prepare_managed_providers(&spec, &snapshot, &connected).await?;
@@ -306,14 +330,20 @@ impl CampaignRunner {
                 break;
             }
         }
-        let drift = match &spec.dataset {
-            DatasetSpec::ExistingOracle {
-                verify_unchanged: true,
-                ..
-            } => verify_existing_targets(&spec, &snapshot, &connected)
+        let verify_unchanged = match &spec.dataset {
+            DatasetSpec::Tables {
+                verify_unchanged, ..
+            }
+            | DatasetSpec::Variant {
+                verify_unchanged, ..
+            } => *verify_unchanged,
+        };
+        let drift = if verify_unchanged {
+            verify_existing_targets(&spec, &snapshot, &connected)
                 .await
-                .err(),
-            _ => None,
+                .err()
+        } else {
+            None
         };
         cleanup_managed_providers(&spec, &connected, &owned).await?;
         store.write_summary(&serde_json::to_value(&report)?)?;
@@ -346,29 +376,108 @@ impl CampaignRunner {
         Ok(connected)
     }
 
-    async fn snapshot_existing_oracle(
+    async fn build_snapshot(
         &self,
-        oracle: &VariantSpec,
-        include: &[String],
+        spec: &CampaignSpec,
         providers: &BTreeMap<String, Arc<dyn ProviderInstance>>,
         builder: &SnapshotBuilder,
     ) -> Result<DatasetSnapshot> {
-        let context = self.create_session(oracle)?;
+        match &spec.dataset {
+            DatasetSpec::Tables { sources, .. } => {
+                let mut fixtures = Vec::new();
+                let mut from_variant: Vec<(LogicalTableName, String)> = Vec::new();
+                for source in sources {
+                    match source {
+                        TableSource::Fixture(fixture) => fixtures.push(fixture.clone()),
+                        TableSource::FromVariant { table, variant } => {
+                            from_variant.push((table.clone(), variant.clone()));
+                        }
+                    }
+                }
+                let (mut schemas, mut batches) = builder.collect_fixtures(&fixtures).await?;
+                for (table, variant_name) in &from_variant {
+                    let variant = &spec.variants[variant_name];
+                    let (remote, instance) = resolve_variant_binding(variant, table)?;
+                    let targets = vec![(table.clone(), remote, instance)];
+                    let (table_schemas, table_batches) =
+                        self.snapshot_variant_tables(variant, &targets, providers).await?;
+                    for (name, schema) in table_schemas {
+                        if schemas.contains_key(&name) {
+                            return Err(Error::Dataset {
+                                table: name,
+                                message: "table is defined by more than one dataset source"
+                                    .to_owned(),
+                            });
+                        }
+                        schemas.insert(name, schema);
+                    }
+                    for (name, value) in table_batches {
+                        batches.insert(name, value);
+                    }
+                }
+                if schemas.is_empty() {
+                    return Err(Error::Dataset {
+                        table: "*".to_owned(),
+                        message: "dataset produced no tables".to_owned(),
+                    });
+                }
+                builder.build_from_batches(schemas, batches)
+            }
+            DatasetSpec::Variant { variant, .. } => {
+                let _ = oracle_name;
+                let variant_spec = &spec.variants[variant];
+                let mut targets = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for binding in variant_spec.tables.values() {
+                    let TableBinding::Provider { instance, .. } = binding else {
+                        continue;
+                    };
+                    if !seen.insert(instance.clone()) {
+                        continue;
+                    }
+                    let discovered = providers[instance]
+                        .discover(&TableSelection::default())
+                        .await?;
+                    for table in discovered {
+                        targets.push((table.logical_name, table.remote, instance.clone()));
+                    }
+                }
+                if targets.is_empty() {
+                    return Err(Error::Dataset {
+                        table: "*".to_owned(),
+                        message: format!("variant `{variant}` discovered no tables"),
+                    });
+                }
+                let (schemas, batches) = self
+                    .snapshot_variant_tables(variant_spec, &targets, providers)
+                    .await?;
+                builder.build_from_batches(schemas, batches)
+            }
+        }
+    }
+
+    /// Snapshot a set of logical tables from a variant's provider(s). Each target is
+    /// `(logical_name, remote_ref, provider_instance)`. The tables are registered into
+    /// a session built from the variant and materialized with `SELECT *`.
+    async fn snapshot_variant_tables(
+        &self,
+        variant: &VariantSpec,
+        targets: &[(LogicalTableName, RemoteTableRef, String)],
+        providers: &BTreeMap<String, Arc<dyn ProviderInstance>>,
+    ) -> Result<(
+        BTreeMap<String, arrow::datatypes::SchemaRef>,
+        BTreeMap<String, Vec<RecordBatch>>,
+    )> {
+        let context = self.create_session(variant)?;
         let mut provider_schemas = BTreeMap::new();
-        for logical in include {
-            let TableBinding::Provider { instance, remote } = &oracle.tables[logical] else {
-                unreachable!("existing-oracle validation requires provider bindings");
-            };
-            let remote = remote
-                .clone()
-                .unwrap_or_else(|| RemoteTableRef(logical.clone()));
-            let table_provider = providers[instance].table_provider(&remote).await?;
+        for (logical, remote, instance) in targets {
+            let table_provider = providers[instance].table_provider(remote).await?;
             provider_schemas.insert(logical.clone(), table_provider.schema());
             context.register_table(logical, table_provider)?;
         }
         let mut schemas = BTreeMap::new();
         let mut batches = BTreeMap::new();
-        for logical in include {
+        for (logical, _, _) in targets {
             let escaped = logical.replace('"', "\"\"");
             let result = context
                 .sql(&format!("SELECT * FROM \"{escaped}\""))
@@ -382,7 +491,7 @@ impl CampaignRunner {
             schemas.insert(logical.clone(), schema);
             batches.insert(logical.clone(), result);
         }
-        builder.build_from_batches(schemas, batches)
+        Ok((schemas, batches))
     }
 
     fn create_session(&self, variant: &VariantSpec) -> Result<SessionContext> {
@@ -463,6 +572,26 @@ fn oracle_name(spec: &CampaignSpec) -> Result<&str> {
         [] => configuration("variants", "mark exactly one variant with `oracle: true`"),
         _ => configuration("variants", "only one variant can set `oracle: true`"),
     }
+}
+
+fn resolve_variant_binding(
+    variant: &VariantSpec,
+    logical: &str,
+) -> Result<(RemoteTableRef, String)> {
+    let binding = variant
+        .tables
+        .get(logical)
+        .or_else(|| variant.tables.get("*"));
+    let Some(TableBinding::Provider { instance, remote }) = binding else {
+        return configuration(
+            &format!("variants.{}.tables.{logical}", variant.name),
+            "a variant-sourced table must bind a provider",
+        );
+    };
+    let remote = remote
+        .clone()
+        .unwrap_or_else(|| RemoteTableRef(logical.to_owned()));
+    Ok((remote, instance.clone()))
 }
 
 fn managed_targets(spec: &CampaignSpec, snapshot: &DatasetSnapshot) -> Result<Vec<ManagedTarget>> {
@@ -766,8 +895,17 @@ mod tests {
 
     use crate::{
         DatasetSpec, FixtureSource, GeneratedQuery, Ordering, QueryProvenance, RunLimits,
-        SessionSpec, VariantSpec,
+        SessionSpec, TableSource, VariantSpec,
     };
+
+    fn sql_fixtures(sql: &str) -> DatasetSpec {
+        DatasetSpec::Tables {
+            sources: vec![TableSource::Fixture(FixtureSource::SqlInline {
+                sql: sql.to_owned(),
+            })],
+            verify_unchanged: true,
+        }
+    }
 
     use super::*;
 
@@ -788,9 +926,7 @@ mod tests {
             .collect();
         CampaignSpec {
             name: "validation".to_owned(),
-            dataset: DatasetSpec::Fixtures(vec![FixtureSource::SqlInline {
-                sql: "CREATE TABLE t(i INT);".to_owned(),
-            }]),
+            dataset: sql_fixtures("CREATE TABLE t(i INT);"),
             providers: BTreeMap::new(),
             variants,
             corpus: vec![GeneratedQuery::corpus("SELECT * FROM t", None)],
@@ -829,10 +965,9 @@ mod tests {
         let report = CampaignRunner::new()
             .run(CampaignSpec {
                 name: "smoke".to_owned(),
-                dataset: DatasetSpec::Fixtures(vec![FixtureSource::SqlInline {
-                    sql: "CREATE TABLE t(i INT); INSERT INTO t VALUES (1), (2), (2), (NULL);"
-                        .to_owned(),
-                }]),
+                dataset: sql_fixtures(
+                    "CREATE TABLE t(i INT); INSERT INTO t VALUES (1), (2), (2), (NULL);",
+                ),
                 providers: BTreeMap::new(),
                 variants,
                 corpus: vec![GeneratedQuery {

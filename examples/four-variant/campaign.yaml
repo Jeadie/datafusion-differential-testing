@@ -1,11 +1,8 @@
-version: 1
 name: four-variant-smoke
 
 dataset:
-  mode: fixtures
-  fixtures:
-    - type: sql
-      path: fixtures/data.sql
+  paths:
+    - fixtures/data.sql
 
 campaign:
   max_queries: 100
@@ -17,26 +14,18 @@ artifacts:
 providers:
   duck_shared:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-shared.db
   duck_orders:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-orders.db
   duck_customers:
     type: duckdb
-    lifecycle: managed
-    teardown: true
     params:
       duckdb_open: .datafusion-differential-test/duck-customers.db
   sqlite:
     type: sqlite
-    lifecycle: managed
-    teardown: true
     params:
       sqlite_open: .datafusion-differential-test/sqlite.db
 

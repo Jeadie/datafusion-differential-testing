@@ -8,14 +8,16 @@ use std::{
 use datafusion_differential_testing::{
     CampaignSpec, DatasetSpec, FixtureSource, GeneratedQuery, Ordering, ProviderLifecycle,
     ProviderSpec, QueryProvenance, RemoteTableRef, RunLimits, SessionExtensionSpec, SessionSpec,
-    TableBinding, VariantSpec,
+    TableBinding, TableSource, VariantSpec,
 };
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default = "default_version")]
     pub version: u32,
+    #[serde(default = "default_name")]
     pub name: String,
     pub dataset: DatasetConfig,
     #[serde(default)]
@@ -28,41 +30,39 @@ pub struct Config {
     pub generators: Vec<GeneratorConfig>,
 }
 
+/// The `dataset:` value accepts three shapes:
+/// - a sequence of per-table entries (`Entries`), fixture type inferred from the
+///   file extension or a single table sourced from another variant;
+/// - a map with `paths:` (multi-table SQL fixtures) or `variant:` (whole-variant
+///   discovery), both handled by `Map`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DatasetConfig {
+    Entries(Vec<DatasetEntry>),
+    Map(DatasetMap),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DatasetConfig {
-    pub mode: String,
+pub struct DatasetMap {
     #[serde(default)]
-    pub fixtures: Vec<FixtureConfig>,
+    pub paths: Vec<PathBuf>,
     #[serde(default)]
-    pub include: Vec<String>,
+    pub variant: Option<String>,
     #[serde(default = "default_true")]
     pub verify_existing_unchanged: bool,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum FixtureConfig {
-    Sql {
-        path: Option<PathBuf>,
-        sql: Option<String>,
-    },
-    Arrow {
-        name: String,
-        path: PathBuf,
-    },
-    Parquet {
-        name: String,
-        path: PathBuf,
-        #[serde(default)]
-        options: BTreeMap<String, String>,
-    },
-    Csv {
-        name: String,
-        path: PathBuf,
-        #[serde(default)]
-        options: BTreeMap<String, String>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct DatasetEntry {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -97,7 +97,8 @@ impl Default for ArtifactConfig {
 pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub kind: String,
-    pub lifecycle: String,
+    #[serde(default)]
+    pub lifecycle: Option<String>,
     pub teardown: Option<bool>,
     #[serde(default)]
     pub params: BTreeMap<String, String>,
@@ -211,71 +212,13 @@ impl Config {
                 self.version
             ));
         }
-        let verify_existing_unchanged = self.dataset.verify_existing_unchanged;
-        let mut fixtures = Vec::new();
-        for fixture in self.dataset.fixtures {
-            match fixture {
-                FixtureConfig::Sql { path, sql } => match (path, sql) {
-                    (Some(path), None) => fixtures.push(FixtureSource::Sql {
-                        path: resolve(base, &path)?,
-                    }),
-                    (None, Some(sql)) => fixtures.push(FixtureSource::SqlInline { sql }),
-                    _ => {
-                        return Err(
-                            "each SQL fixture requires exactly one of `path` or `sql`".to_owned()
-                        )
-                    }
-                },
-                FixtureConfig::Arrow { name, path } => fixtures.push(FixtureSource::ArrowIpc {
-                    name,
-                    path: resolve(base, &path)?,
-                }),
-                FixtureConfig::Parquet {
-                    name,
-                    path,
-                    options,
-                } => {
-                    if !options.is_empty() {
-                        return Err(
-                            "Parquet fixture options are not supported in version 1".to_owned()
-                        );
-                    }
-                    fixtures.push(FixtureSource::Parquet {
-                        name,
-                        path: resolve(base, &path)?,
-                    });
-                }
-                FixtureConfig::Csv {
-                    name,
-                    path,
-                    options,
-                } => fixtures.push(FixtureSource::Csv {
-                    name,
-                    path: resolve(base, &path)?,
-                    options,
-                }),
-            }
-        }
-        let dataset = match self.dataset.mode.as_str() {
-            "fixtures" if self.dataset.include.is_empty() => DatasetSpec::Fixtures(fixtures),
-            "fixtures" => {
-                return Err("dataset.include is valid only when mode is `oracle`".to_owned());
-            }
-            "oracle" if fixtures.is_empty() => DatasetSpec::ExistingOracle {
-                include: self.dataset.include,
-                verify_unchanged: verify_existing_unchanged,
-            },
-            "oracle" => {
-                return Err("dataset.fixtures is invalid when mode is `oracle`".to_owned());
-            }
-            value => return Err(format!("dataset.mode has unsupported value `{value}`")),
-        };
+        let dataset = self.dataset.into_spec(base)?;
 
         let providers = self
             .providers
             .into_iter()
             .map(|(name, provider)| {
-                let lifecycle = match provider.lifecycle.as_str() {
+                let lifecycle = match provider.lifecycle.as_deref().unwrap_or("managed") {
                     "managed" => ProviderLifecycle::Managed {
                         teardown: provider.teardown.unwrap_or(true),
                     },
@@ -447,6 +390,118 @@ impl Config {
     }
 }
 
+impl DatasetConfig {
+    fn into_spec(self, base: &Path) -> Result<DatasetSpec, String> {
+        match self {
+            DatasetConfig::Map(map) => {
+                let has_paths = !map.paths.is_empty();
+                match (has_paths, map.variant) {
+                    (true, Some(_)) => {
+                        Err("dataset accepts `paths` or `variant`, not both".to_owned())
+                    }
+                    (false, None) => {
+                        Err("dataset requires `paths`, `variant`, or a table sequence".to_owned())
+                    }
+                    (true, None) => {
+                        let mut sources = Vec::new();
+                        for path in map.paths {
+                            sources.push(TableSource::Fixture(FixtureSource::Sql {
+                                path: resolve(base, &path)?,
+                            }));
+                        }
+                        Ok(DatasetSpec::Tables {
+                            sources,
+                            verify_unchanged: map.verify_existing_unchanged,
+                        })
+                    }
+                    (false, Some(variant)) => Ok(DatasetSpec::Variant {
+                        variant,
+                        verify_unchanged: map.verify_existing_unchanged,
+                    }),
+                }
+            }
+            DatasetConfig::Entries(entries) => {
+                let mut sources = Vec::new();
+                for (index, entry) in entries.into_iter().enumerate() {
+                    sources.push(entry.into_source(base, index)?);
+                }
+                Ok(DatasetSpec::Tables {
+                    sources,
+                    verify_unchanged: true,
+                })
+            }
+        }
+    }
+}
+
+impl DatasetEntry {
+    fn into_source(self, base: &Path, index: usize) -> Result<TableSource, String> {
+        match (self.path, self.variant) {
+            (Some(_), Some(_)) => Err(format!("dataset[{index}] sets both `path` and `variant`")),
+            (None, None) => Err(format!("dataset[{index}] requires `path` or `variant`")),
+            (None, Some(variant)) => {
+                if !self.options.is_empty() {
+                    return Err(format!(
+                        "dataset[{index}].options is not supported for a variant source"
+                    ));
+                }
+                Ok(TableSource::FromVariant {
+                    table: self.name,
+                    variant,
+                })
+            }
+            (Some(path), None) => {
+                let extension = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase);
+                let resolved = resolve(base, &path)?;
+                let fixture = match extension.as_deref() {
+                    Some("arrow") => {
+                        reject_options(&self.options, index, "Arrow IPC")?;
+                        FixtureSource::ArrowIpc {
+                            name: self.name,
+                            path: resolved,
+                        }
+                    }
+                    Some("parquet") => {
+                        reject_options(&self.options, index, "Parquet")?;
+                        FixtureSource::Parquet {
+                            name: self.name,
+                            path: resolved,
+                        }
+                    }
+                    Some("csv") => FixtureSource::Csv {
+                        name: self.name,
+                        path: resolved,
+                        options: self.options,
+                    },
+                    other => {
+                        return Err(format!(
+                            "dataset[{index}].path has unsupported file extension `{}`; \
+                             expected .arrow, .csv, or .parquet",
+                            other.unwrap_or("")
+                        ));
+                    }
+                };
+                Ok(TableSource::Fixture(fixture))
+            }
+        }
+    }
+}
+
+fn reject_options(
+    options: &BTreeMap<String, String>,
+    index: usize,
+    kind: &str,
+) -> Result<(), String> {
+    if options.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("dataset[{index}].options is not supported for {kind}"))
+    }
+}
+
 fn resolve(base: &Path, value: &Path) -> Result<PathBuf, String> {
     reject_expansion(&value.to_string_lossy())?;
     Ok(if value.is_absolute() {
@@ -478,9 +533,174 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_version() -> u32 {
+    1
+}
+
+fn default_name() -> String {
+    "campaign".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec_from(yaml: &str) -> CampaignSpec {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
+        let config: Config = serde_yaml::from_value(value).expect("valid config");
+        config.into_spec(Path::new("/base")).expect("into_spec")
+    }
+
+    const VARIANTS_AND_GENERATORS: &str = r#"
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: corpus
+    sql:
+      - "SELECT 1"
+"#;
+
+    #[test]
+    fn dataset_paths_map_parses_to_sql_tables() {
+        let yaml = format!(
+            "name: t\ndataset:\n  paths:\n    - fixtures/data.sql\n{VARIANTS_AND_GENERATORS}"
+        );
+        let spec = spec_from(&yaml);
+        let DatasetSpec::Tables {
+            sources,
+            verify_unchanged,
+        } = spec.dataset
+        else {
+            panic!("expected Tables dataset");
+        };
+        assert!(verify_unchanged);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(
+            sources[0],
+            TableSource::Fixture(FixtureSource::Sql {
+                path: PathBuf::from("/base/fixtures/data.sql"),
+            })
+        );
+    }
+
+    #[test]
+    fn dataset_entry_sequence_infers_extensions_and_variant() {
+        let yaml = format!(
+            r#"name: t
+dataset:
+  - name: orders
+    path: fixtures/orders.arrow
+  - name: customers
+    path: fixtures/customers.csv
+    options:
+      has_header: "true"
+  - name: events
+    path: fixtures/events.parquet
+  - name: lineitem
+    variant: oracle
+{VARIANTS_AND_GENERATORS}"#
+        );
+        let spec = spec_from(&yaml);
+        let DatasetSpec::Tables { sources, .. } = spec.dataset else {
+            panic!("expected Tables dataset");
+        };
+        assert_eq!(sources.len(), 4);
+        assert!(matches!(
+            sources[0],
+            TableSource::Fixture(FixtureSource::ArrowIpc { .. })
+        ));
+        assert!(matches!(
+            sources[1],
+            TableSource::Fixture(FixtureSource::Csv { .. })
+        ));
+        assert!(matches!(
+            sources[2],
+            TableSource::Fixture(FixtureSource::Parquet { .. })
+        ));
+        assert_eq!(
+            sources[3],
+            TableSource::FromVariant {
+                table: "lineitem".to_owned(),
+                variant: "oracle".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn dataset_variant_map_parses_to_variant() {
+        let yaml =
+            format!("name: t\ndataset:\n  variant: oracle\n{VARIANTS_AND_GENERATORS}");
+        let spec = spec_from(&yaml);
+        assert_eq!(
+            spec.dataset,
+            DatasetSpec::Variant {
+                variant: "oracle".to_owned(),
+                verify_unchanged: true,
+            }
+        );
+    }
+
+    #[test]
+    fn dataset_entry_rejects_unknown_extension() {
+        let yaml = format!(
+            "name: t\ndataset:\n  - name: bad\n    path: fixtures/data.txt\n{VARIANTS_AND_GENERATORS}"
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("valid YAML");
+        let config: Config = serde_yaml::from_value(value).expect("valid config");
+        let error = config
+            .into_spec(Path::new("/base"))
+            .expect_err("unknown extension must fail");
+        assert!(error.contains("unsupported file extension"));
+    }
+
+    #[test]
+    fn dataset_entry_rejects_path_and_variant() {
+        let yaml = format!(
+            "name: t\ndataset:\n  - name: bad\n    path: a.csv\n    variant: oracle\n{VARIANTS_AND_GENERATORS}"
+        );
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("valid YAML");
+        let config: Config = serde_yaml::from_value(value).expect("valid config");
+        let error = config
+            .into_spec(Path::new("/base"))
+            .expect_err("path and variant must fail");
+        assert!(error.contains("both `path` and `variant`"));
+    }
+
+    #[test]
+    fn provider_lifecycle_defaults_to_managed_and_params_optional() {
+        let yaml = format!(
+            r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+providers:
+  in_memory:
+    type: duckdb
+{VARIANTS_AND_GENERATORS}"#
+        );
+        let spec = spec_from(&yaml);
+        let provider = &spec.providers["in_memory"];
+        assert_eq!(
+            provider.lifecycle,
+            ProviderLifecycle::Managed { teardown: true }
+        );
+        assert!(provider.params.is_empty());
+    }
+
+    #[test]
+    fn version_and_name_are_optional() {
+        let yaml = format!(
+            "dataset:\n  paths:\n    - fixtures/data.sql\n{VARIANTS_AND_GENERATORS}"
+        );
+        let spec = spec_from(&yaml);
+        assert_eq!(spec.name, "campaign");
+    }
 
     #[test]
     fn yaml_rejects_duplicate_keys() {

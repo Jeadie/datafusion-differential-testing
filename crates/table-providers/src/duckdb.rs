@@ -13,7 +13,11 @@ use datafusion_differential_testing::{
     UnresolvedParams,
 };
 use datafusion_table_providers::{
-    duckdb::DuckDBTableFactory, sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,
+    duckdb::DuckDBTableFactory,
+    sql::db_connection_pool::{
+        dbconnection::duckdbconn::DuckDbConnection,
+        duckdbpool::DuckDbConnectionPool,
+    },
 };
 use duckdb::{AccessMode, Config, Connection};
 use futures::TryStreamExt;
@@ -38,23 +42,40 @@ impl ProviderFactory for DuckDbProviderFactory {
         params: &ResolvedParams,
         lifecycle: &ProviderLifecycle,
     ) -> Result<Arc<dyn ProviderInstance>> {
-        let path = PathBuf::from(required(params, "duckdb_open")?);
         let read_only = matches!(lifecycle, ProviderLifecycle::Existing);
-        if read_only && !path.exists() {
-            return Err(provider_message(
-                name,
-                format!("existing DuckDB file `{}` does not exist", path.display()),
-            ));
-        }
-        if !read_only {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| provider_error(name, error))?;
+        let backing = match params.get("duckdb_open") {
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if read_only && !path.exists() {
+                    return Err(provider_message(
+                        name,
+                        format!("existing DuckDB file `{}` does not exist", path.display()),
+                    ));
+                }
+                if !read_only {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|error| provider_error(name, error))?;
+                    }
+                }
+                open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
+                DuckDbBacking::File(path)
             }
-        }
-        open_connection(&path, read_only).map_err(|error| provider_error(name, error))?;
+            None => {
+                if read_only {
+                    return Err(provider_message(
+                        name,
+                        "existing DuckDB provider requires a `duckdb_open` path; an in-memory database has no backing file",
+                    ));
+                }
+                let pool = DuckDbConnectionPool::new_memory()
+                    .map_err(|error| provider_error(name, error))?;
+                DuckDbBacking::Memory(Arc::new(pool))
+            }
+        };
         Ok(Arc::new(DuckDbInstance {
             name: name.to_owned(),
-            path,
+            backing,
             read_only,
             factory: Mutex::new(None),
             providers: Mutex::new(BTreeMap::new()),
@@ -62,9 +83,14 @@ impl ProviderFactory for DuckDbProviderFactory {
     }
 }
 
+enum DuckDbBacking {
+    File(PathBuf),
+    Memory(Arc<DuckDbConnectionPool>),
+}
+
 struct DuckDbInstance {
     name: String,
-    path: PathBuf,
+    backing: DuckDbBacking,
     read_only: bool,
     factory: Mutex<Option<Arc<DuckDBTableFactory>>>,
     providers: Mutex<BTreeMap<RemoteTableRef, Arc<dyn TableProvider>>>,
@@ -88,16 +114,12 @@ impl ProviderInstance for DuckDbInstance {
     }
 
     async fn discover(&self, _selection: &TableSelection) -> Result<Vec<DiscoveredTable>> {
-        let connection = open_connection(&self.path, self.read_only)
-            .map_err(|error| provider_error(&self.name, error))?;
-        let mut statement = connection
-            .prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name")
-            .map_err(|error| provider_error(&self.name, error))?;
-        let names = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| provider_error(&self.name, error))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| provider_error(&self.name, error))?;
+        let names = self.with_connection(|connection| {
+            let mut statement = connection.prepare("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })?;
         Ok(names
             .into_iter()
             .map(|name| DiscoveredTable {
@@ -117,18 +139,23 @@ impl ProviderInstance for DuckDbInstance {
             if let Some(factory) = factory.as_ref() {
                 Arc::clone(factory)
             } else {
-                let path = self.path.to_str().ok_or_else(|| {
-                    provider_message(&self.name, "duckdb_open is not valid UTF-8")
-                })?;
-                let access = if self.read_only {
-                    AccessMode::ReadOnly
-                } else {
-                    AccessMode::ReadWrite
+                let pool = match &self.backing {
+                    DuckDbBacking::Memory(pool) => Arc::clone(pool),
+                    DuckDbBacking::File(path) => {
+                        let path = path.to_str().ok_or_else(|| {
+                            provider_message(&self.name, "duckdb_open is not valid UTF-8")
+                        })?;
+                        let access = if self.read_only {
+                            AccessMode::ReadOnly
+                        } else {
+                            AccessMode::ReadWrite
+                        };
+                        Arc::new(
+                            DuckDbConnectionPool::new_file(path, &access)
+                                .map_err(|error| provider_error(&self.name, error))?,
+                        )
+                    }
                 };
-                let pool = Arc::new(
-                    DuckDbConnectionPool::new_file(path, &access)
-                        .map_err(|error| provider_error(&self.name, error))?,
-                );
                 let created = Arc::new(DuckDBTableFactory::new(pool));
                 *factory = Some(Arc::clone(&created));
                 created
@@ -172,11 +199,9 @@ impl ManagedProvider for DuckDbInstance {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        Connection::open(&self.path)
-            .and_then(|connection| {
-                connection.execute_batch(&format!("CREATE TABLE {} ({columns})", quote(&table.0)))
-            })
-            .map_err(|error| provider_error(&self.name, error))
+        self.with_connection(|connection| {
+            connection.execute_batch(&format!("CREATE TABLE {} ({columns})", quote(&table.0)))
+        })
     }
 
     async fn load(
@@ -196,46 +221,65 @@ impl ManagedProvider for DuckDbInstance {
         let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         let stream = FFI_ArrowArrayStream::new(Box::new(reader));
         let view = format!("__datafusion_diff_{}", safe_identifier(&table.0));
-        let connection =
-            Connection::open(&self.path).map_err(|error| provider_error(&self.name, error))?;
-        connection
-            .register_arrow_scan_view(&view, &stream)
-            .map_err(|error| provider_error(&self.name, error))?;
-        connection
-            .execute_batch(&format!(
+        self.with_connection(|connection| {
+            connection.register_arrow_scan_view(&view, &stream)?;
+            connection.execute_batch(&format!(
                 "INSERT INTO {} SELECT * FROM {}",
                 quote(&table.0),
                 quote(&view)
-            ))
-            .map_err(|error| provider_error(&self.name, error))?;
-        connection
-            .execute_batch(&format!("DROP VIEW {}", quote(&view)))
-            .map_err(|error| provider_error(&self.name, error))?;
+            ))?;
+            connection.execute_batch(&format!("DROP VIEW {}", quote(&view)))
+        })?;
         Ok(LoadReport { rows_loaded })
     }
 
     async fn drop_table(&self, table: &RemoteTableRef) -> Result<()> {
-        Connection::open(&self.path)
-            .and_then(|connection| {
-                connection.execute_batch(&format!("DROP TABLE {}", quote(&table.0)))
-            })
-            .map_err(|error| provider_error(&self.name, error))?;
+        self.with_connection(|connection| {
+            connection.execute_batch(&format!("DROP TABLE {}", quote(&table.0)))
+        })?;
         self.providers.lock().await.remove(table);
         Ok(())
     }
 }
 
 impl DuckDbInstance {
+    /// Run `f` with a `Connection` bound to this instance's backing database.
+    ///
+    /// For an in-memory instance, every connection comes from one shared pool so
+    /// all operations observe the same database.
+    fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> duckdb::Result<T>,
+    ) -> Result<T> {
+        match &self.backing {
+            DuckDbBacking::File(path) => {
+                let connection = open_connection(path, self.read_only)
+                    .map_err(|error| provider_error(&self.name, error))?;
+                f(&connection).map_err(|error| provider_error(&self.name, error))
+            }
+            DuckDbBacking::Memory(pool) => {
+                let mut boxed = Arc::clone(pool)
+                    .connect_sync()
+                    .map_err(|error| provider_error(&self.name, error))?;
+                let connection = boxed
+                    .as_any_mut()
+                    .downcast_mut::<DuckDbConnection>()
+                    .ok_or_else(|| {
+                        provider_message(&self.name, "unexpected DuckDB connection type")
+                    })?;
+                f(&connection.conn).map_err(|error| provider_error(&self.name, error))
+            }
+        }
+    }
+
     fn table_exists_impl(&self, table: &RemoteTableRef) -> Result<bool> {
-        let connection = open_connection(&self.path, self.read_only)
-            .map_err(|error| provider_error(&self.name, error))?;
-        let count: i64 = connection
-            .query_row(
+        let count: i64 = self.with_connection(|connection| {
+            connection.query_row(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
                 [&table.0],
                 |row| row.get(0),
             )
-            .map_err(|error| provider_error(&self.name, error))?;
+        })?;
         Ok(count != 0)
     }
 }
@@ -269,15 +313,10 @@ fn duckdb_type(data_type: &DataType) -> std::result::Result<&'static str, &'stat
     }
 }
 
-fn validate_params(params: &UnresolvedParams, required_key: &str) -> Result<()> {
-    if !params.contains_key(required_key) {
-        return Err(provider_message(
-            "duckdb",
-            format!("missing `{required_key}` parameter"),
-        ));
-    }
+fn validate_params(params: &UnresolvedParams, allowed_key: &str) -> Result<()> {
+    // A missing path key means the provider runs against an in-memory database.
     for key in params.keys() {
-        if key != required_key {
+        if key != allowed_key {
             return Err(provider_message(
                 "duckdb",
                 format!("unknown parameter `{key}`"),
@@ -285,13 +324,6 @@ fn validate_params(params: &UnresolvedParams, required_key: &str) -> Result<()> 
         }
     }
     Ok(())
-}
-
-fn required<'a>(params: &'a ResolvedParams, key: &str) -> Result<&'a str> {
-    params
-        .get(key)
-        .map(String::as_str)
-        .ok_or_else(|| provider_message("duckdb", format!("missing `{key}` parameter")))
 }
 
 fn quote(value: &str) -> String {
@@ -319,5 +351,97 @@ fn provider_message(name: &str, message: impl Into<String>) -> Error {
     Error::Provider {
         provider: name.to_owned(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::Field,
+        record_batch::RecordBatch,
+    };
+    use datafusion::{physical_plan::stream::RecordBatchStreamAdapter, prelude::SessionContext};
+
+    fn sample_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn in_memory_roundtrip_shares_one_database() {
+        let factory = DuckDbProviderFactory;
+        let params = ResolvedParams::new();
+        let lifecycle = ProviderLifecycle::Managed { teardown: true };
+        let instance = factory
+            .connect("in_memory_duckdb", &params, &lifecycle)
+            .await
+            .expect("connect in-memory instance");
+        let managed = instance.managed().expect("managed provider");
+        let schema = sample_schema();
+        let table = RemoteTableRef("people".to_owned());
+
+        managed
+            .create_table(&table, Arc::clone(&schema))
+            .await
+            .expect("create table");
+        assert!(managed.table_exists(&table).await.expect("table exists"));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+            ],
+        )
+        .expect("record batch");
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let report = managed.load(&table, stream).await.expect("load rows");
+        assert_eq!(report.rows_loaded, 3);
+
+        let provider = instance
+            .table_provider(&table)
+            .await
+            .expect("table provider");
+        let ctx = SessionContext::new();
+        ctx.register_table("people", provider)
+            .expect("register table");
+        let results = ctx
+            .sql("SELECT id, name FROM people ORDER BY id")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("run query");
+        let rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 3);
+    }
+
+    #[tokio::test]
+    async fn in_memory_rejects_existing_lifecycle() {
+        let factory = DuckDbProviderFactory;
+        let params = ResolvedParams::new();
+        let result = factory
+            .connect("in_memory_duckdb", &params, &ProviderLifecycle::Existing)
+            .await;
+        assert!(matches!(result, Err(Error::Provider { .. })));
+    }
+
+    #[test]
+    fn validate_accepts_empty_params_and_rejects_unknown() {
+        let factory = DuckDbProviderFactory;
+        assert!(factory.validate(&UnresolvedParams::new()).is_ok());
+        let mut params = UnresolvedParams::new();
+        params.insert("duckdb_open".to_owned(), "db.duckdb".to_owned());
+        assert!(factory.validate(&params).is_ok());
+        let mut unknown = UnresolvedParams::new();
+        unknown.insert("nope".to_owned(), "x".to_owned());
+        assert!(factory.validate(&unknown).is_err());
     }
 }

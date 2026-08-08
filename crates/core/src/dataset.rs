@@ -55,10 +55,33 @@ impl SnapshotBuilder {
     }
 
     pub async fn build(&self, fixtures: &[FixtureSource]) -> Result<DatasetSnapshot> {
+        let (schemas, batches) = self.collect_fixtures(fixtures).await?;
+        if schemas.is_empty() {
+            return Err(Error::Dataset {
+                table: "*".to_owned(),
+                message: "fixtures produced no tables".to_owned(),
+            });
+        }
+        self.build_from_batches(schemas, batches)
+    }
+
+    /// Register fixtures into a session and collect every resulting table's schema
+    /// and batches. Unlike [`build`], this does not write IPC and tolerates an empty
+    /// fixture set so callers can merge variant-sourced tables before building.
+    pub async fn collect_fixtures(
+        &self,
+        fixtures: &[FixtureSource],
+    ) -> Result<(
+        BTreeMap<String, SchemaRef>,
+        BTreeMap<String, Vec<RecordBatch>>,
+    )> {
         fs::create_dir_all(&self.output_directory).map_err(|source| Error::Artifact {
             path: self.output_directory.clone(),
             source,
         })?;
+        if fixtures.is_empty() {
+            return Ok((BTreeMap::new(), BTreeMap::new()));
+        }
         let context = SessionContext::new();
         for fixture in fixtures {
             match fixture {
@@ -107,12 +130,6 @@ impl SnapshotBuilder {
         })?;
         let mut table_names = schema.table_names();
         table_names.sort();
-        if table_names.is_empty() {
-            return Err(Error::Dataset {
-                table: "*".to_owned(),
-                message: "fixtures produced no tables".to_owned(),
-            });
-        }
 
         let mut collected = BTreeMap::new();
         let mut schemas = BTreeMap::new();
@@ -138,7 +155,7 @@ impl SnapshotBuilder {
             schemas.insert(name.clone(), schema);
             collected.insert(name, batches);
         }
-        self.build_from_batches(schemas, collected)
+        Ok((schemas, collected))
     }
 
     pub fn build_from_batches(
@@ -199,7 +216,7 @@ fn csv_options(options: &BTreeMap<String, String>) -> Result<CsvReadOptions<'sta
         match key.as_str() {
             "has_header" => {
                 parsed = parsed.has_header(value.parse().map_err(|_| Error::Configuration {
-                    path: "dataset.fixtures[].options.has_header".to_owned(),
+                    path: "dataset[].options.has_header".to_owned(),
                     message: "expected `true` or `false`".to_owned(),
                 })?);
             }
@@ -207,7 +224,7 @@ fn csv_options(options: &BTreeMap<String, String>) -> Result<CsvReadOptions<'sta
                 let bytes = value.as_bytes();
                 if bytes.len() != 1 {
                     return Err(Error::Configuration {
-                        path: "dataset.fixtures[].options.delimiter".to_owned(),
+                        path: "dataset[].options.delimiter".to_owned(),
                         message: "expected one ASCII byte".to_owned(),
                     });
                 }
@@ -216,13 +233,13 @@ fn csv_options(options: &BTreeMap<String, String>) -> Result<CsvReadOptions<'sta
             "schema_infer_max_records" => {
                 parsed.schema_infer_max_records =
                     value.parse().map_err(|_| Error::Configuration {
-                        path: "dataset.fixtures[].options.schema_infer_max_records".to_owned(),
+                        path: "dataset[].options.schema_infer_max_records".to_owned(),
                         message: "expected a positive integer".to_owned(),
                     })?;
             }
             _ => {
                 return Err(Error::Configuration {
-                    path: format!("dataset.fixtures[].options.{key}"),
+                    path: format!("dataset[].options.{key}"),
                     message: "unsupported CSV option".to_owned(),
                 });
             }
