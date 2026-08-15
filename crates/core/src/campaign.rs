@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,12 +19,23 @@ use crate::{
     compare::{Comparator, StrictComparator},
     dataset::{logical_hash, SnapshotBuilder},
     error::{Error, Result},
-    CampaignSpec, Comparison, DatasetSnapshot, DatasetSpec, ExecutionError, Finding, FindingId,
-    LogicalTableName, ProviderInstance, ProviderLifecycle, ProviderRegistry, QueryId, QueryOutcome,
-    QueryResult, RemoteTableRef, RunId, RunManifest, SessionExtensionRegistry, TableBinding,
-    TableSelection, TableSource, VariantId, VariantSpec,
+    generator::{GenerationContext, GenerationStep, TableSchema},
+    CampaignSpec, Comparison, CorpusGenerator, DatasetSnapshot, DatasetSpec, ExecutionError,
+    Finding, FindingId, GeneratedQuery, LogicalTableName, MutationGenerator, ProviderInstance,
+    ProviderLifecycle, ProviderRegistry, QueryGenerator, QueryId, QueryOutcome, QueryResult,
+    RandomQueryGenerator, RemoteTableRef, RunId, RunManifest, SessionExtensionRegistry,
+    TableBinding, TableSelection, TableSource, VariantId, VariantSpec,
 };
 use futures::stream;
+
+/// Builds the generator pipeline for a run. Injected via
+/// [`CampaignRunner::with_generators`] to plug in custom query sources.
+pub type GeneratorFactory =
+    Arc<dyn Fn(&CampaignSpec) -> Vec<Box<dyn QueryGenerator>> + Send + Sync>;
+
+/// Builds the artifact sink for a run, given the resolved run directory.
+/// Injected via [`CampaignRunner::with_artifact_store`].
+pub type ArtifactStoreFactory = Arc<dyn Fn(&Path) -> Box<dyn ArtifactStore> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
@@ -57,6 +69,8 @@ pub struct CampaignRunner {
     providers: ProviderRegistry,
     extensions: SessionExtensionRegistry,
     comparator: Arc<dyn Comparator>,
+    generators: Option<GeneratorFactory>,
+    store_factory: Option<ArtifactStoreFactory>,
 }
 
 impl Default for CampaignRunner {
@@ -72,6 +86,8 @@ impl CampaignRunner {
             providers: ProviderRegistry::new(),
             extensions: SessionExtensionRegistry::new(),
             comparator: Arc::new(StrictComparator),
+            generators: None,
+            store_factory: None,
         }
     }
 
@@ -93,12 +109,31 @@ impl CampaignRunner {
         self
     }
 
+    /// Override how the query-generator pipeline is built for a run. The default
+    /// derives generators from the [`CampaignSpec`] (corpus, random, mutation).
+    #[must_use]
+    pub fn with_generators(mut self, generators: GeneratorFactory) -> Self {
+        self.generators = Some(generators);
+        self
+    }
+
+    /// Override the artifact sink. The default writes a [`FileArtifactStore`]
+    /// under the run directory; inject e.g. a no-op store for in-memory runs.
+    #[must_use]
+    pub fn with_artifact_store(mut self, store_factory: ArtifactStoreFactory) -> Self {
+        self.store_factory = Some(store_factory);
+        self
+    }
+
     pub fn validate(&self, spec: &CampaignSpec) -> Result<()> {
         if spec.variants.len() < 2 {
             return configuration("variants", "define at least two variants");
         }
         let oracle_name = oracle_name(spec)?;
-        if spec.corpus.is_empty() && spec.random_generators.is_empty() {
+        // A custom generator pipeline (with_generators) supplies its own queries,
+        // so the spec need not declare corpus or random generators in that case.
+        if self.generators.is_none() && spec.corpus.is_empty() && spec.random_generators.is_empty()
+        {
             return configuration(
                 "generators",
                 "define at least one corpus query or random generator",
@@ -247,7 +282,10 @@ impl CampaignRunner {
         let oracle_name = oracle_name(&spec)?.to_owned();
         let run_id = create_run_id()?;
         let run_directory = spec.artifacts.join(slug(&spec.name)).join(run_id.as_str());
-        let store = FileArtifactStore::new(&run_directory);
+        let store: Box<dyn ArtifactStore> = match &self.store_factory {
+            Some(factory) => factory(&run_directory),
+            None => Box::new(FileArtifactStore::new(&run_directory)),
+        };
         let mut variant_names: Vec<_> = spec.variants.keys().cloned().collect();
         variant_names.sort();
         store.initialize(&RunManifest {
@@ -286,20 +324,25 @@ impl CampaignRunner {
             .filter(|(name, _)| *name != &oracle_name)
             .collect();
 
-        // Schema-aware generators run here, once the canonical snapshot (and thus
-        // every table schema) exists. Corpus and generated queries seed a work
-        // queue; with feedback mutation on, a finding-producing query pushes
-        // nearby variants onto the queue so the run digs around the failure.
-        let generated = generate_random_queries(&spec, &snapshot);
-        let mut queue: VecDeque<crate::GeneratedQuery> =
-            spec.corpus.iter().cloned().chain(generated).collect();
-        let mut enqueued: HashSet<String> = queue.iter().map(|query| query.sql.clone()).collect();
-        let mutation = spec
-            .random_generators
+        // Drive the generator pipeline once the canonical snapshot (and thus every
+        // table schema) exists. Each round asks every generator for queries, runs
+        // them, and feeds that round's findings back into the next round so
+        // feedback generators (mutation) can dig around a failure.
+        let schema: Vec<TableSchema> = snapshot
+            .tables
             .iter()
-            .find(|generator| generator.mutate_on_finding)
-            .map(|generator| (generator.mutations_per_finding, generator.seed ^ 0x5F4D_C0DE));
-        let mut mutation_rng = mutation.map(|(_, seed)| crate::rng::Rng::new(seed));
+            .map(|(name, table)| TableSchema {
+                name: name.clone(),
+                schema: table.schema.clone(),
+            })
+            .collect();
+        let mut generators = match &self.generators {
+            Some(factory) => factory(&spec),
+            None => default_generators(&spec),
+        };
+        let mut finished = vec![false; generators.len()];
+        let mut enqueued: HashSet<String> = HashSet::new();
+        let mut last_findings: Vec<Finding> = Vec::new();
 
         let mut report = RunReport {
             run_id,
@@ -310,72 +353,76 @@ impl CampaignRunner {
             findings: Vec::new(),
         };
         let mut query_index = 0;
-        while let Some(query) = queue.pop_front() {
-            if query_index >= spec.limits.max_queries {
-                break;
-            }
-            let query_id = QueryId::new(format!("query-{query_index:06}"))?;
-            query_index += 1;
-            report.generated_queries += 1;
-            let oracle_outcome = execute_query(oracle, &query, spec.limits.query_timeout).await;
-            if !matches!(oracle_outcome, QueryOutcome::Success(_)) {
-                report.oracle_rejections += 1;
-                continue;
-            }
-            report.executed_queries += 1;
-            let mut query_produced_finding = false;
-            for (candidate_name, candidate) in &candidates {
-                let outcome = execute_query(candidate, &query, spec.limits.query_timeout).await;
-                if let Comparison::Different(difference) =
-                    self.comparator
-                        .compare(&oracle_outcome, &outcome, query.is_ordered())
-                {
-                    query_produced_finding = true;
-                    let finding_index = report.findings.len();
-                    let finding = Finding {
-                        id: FindingId::new(format!("finding-{finding_index:06}"))?,
-                        query_id: query_id.clone(),
-                        candidate: VariantId::new((*candidate_name).clone())?,
-                        kind: difference.kind,
-                        message: difference.message,
-                        sql: query.sql.clone(),
-                    };
-                    store.write_finding(&finding)?;
-                    report.findings.push(finding);
-                    if report.findings.len() >= spec.limits.max_findings
-                        || spec.limits.stop_on_finding
-                    {
-                        break;
-                    }
+        'campaign: while query_index < spec.limits.max_queries {
+            // Collect this round's queries from every still-active generator.
+            let context = GenerationContext {
+                remaining_queries: spec.limits.max_queries - query_index,
+                completed_queries: report.executed_queries,
+                schema: &schema,
+                new_findings: &last_findings,
+            };
+            let mut batch: Vec<GeneratedQuery> = Vec::new();
+            for (index, generator) in generators.iter_mut().enumerate() {
+                if finished[index] {
+                    continue;
+                }
+                match generator.generate(&context).await? {
+                    GenerationStep::Finished => finished[index] = true,
+                    GenerationStep::Queries(queries) => batch.extend(queries),
                 }
             }
-            // Feedback: enqueue mutants of the query that just found something.
-            if query_produced_finding {
-                if let (Some((per_finding, _)), Some(rng)) = (mutation, mutation_rng.as_mut()) {
-                    for sql in crate::mutate::mutate(&query.sql, rng, per_finding) {
-                        if enqueued.insert(sql.clone()) {
-                            queue.push_back(crate::GeneratedQuery {
-                                sql,
-                                ordering: crate::Ordering::Detect,
-                                provenance: crate::QueryProvenance {
-                                    generator: "mutation".to_owned(),
-                                    source: query
-                                        .provenance
-                                        .provided_id
-                                        .clone()
-                                        .or_else(|| Some(query.sql.clone())),
-                                    provided_id: None,
-                                },
-                            });
+            batch.retain(|query| enqueued.insert(query.sql.clone()));
+            // A round with no new queries means the pipeline has converged.
+            if batch.is_empty() {
+                break;
+            }
+
+            let mut round_findings: Vec<Finding> = Vec::new();
+            for query in batch {
+                if query_index >= spec.limits.max_queries {
+                    break;
+                }
+                let query_id = QueryId::new(format!("query-{query_index:06}"))?;
+                query_index += 1;
+                report.generated_queries += 1;
+                let oracle_outcome = execute_query(oracle, &query, spec.limits.query_timeout).await;
+                if !matches!(oracle_outcome, QueryOutcome::Success(_)) {
+                    report.oracle_rejections += 1;
+                    continue;
+                }
+                report.executed_queries += 1;
+                for (candidate_name, candidate) in &candidates {
+                    let outcome = execute_query(candidate, &query, spec.limits.query_timeout).await;
+                    if let Comparison::Different(difference) =
+                        self.comparator
+                            .compare(&oracle_outcome, &outcome, query.is_ordered())
+                    {
+                        let finding_index = report.findings.len();
+                        let finding = Finding {
+                            id: FindingId::new(format!("finding-{finding_index:06}"))?,
+                            query_id: query_id.clone(),
+                            candidate: VariantId::new((*candidate_name).clone())?,
+                            kind: difference.kind,
+                            message: difference.message,
+                            sql: query.sql.clone(),
+                        };
+                        store.write_finding(&finding)?;
+                        report.findings.push(finding.clone());
+                        round_findings.push(finding);
+                        if report.findings.len() >= spec.limits.max_findings
+                            || spec.limits.stop_on_finding
+                        {
+                            break;
                         }
                     }
                 }
+                if report.findings.len() >= spec.limits.max_findings
+                    || (spec.limits.stop_on_finding && !report.findings.is_empty())
+                {
+                    break 'campaign;
+                }
             }
-            if report.findings.len() >= spec.limits.max_findings
-                || (spec.limits.stop_on_finding && !report.findings.is_empty())
-            {
-                break;
-            }
+            last_findings = round_findings;
         }
         let verify_unchanged = match &spec.dataset {
             DatasetSpec::Tables {
@@ -608,29 +655,28 @@ impl CampaignRunner {
 
 type ManagedTarget = (String, RemoteTableRef, String);
 
-fn generate_random_queries(
-    spec: &CampaignSpec,
-    snapshot: &DatasetSnapshot,
-) -> Vec<crate::GeneratedQuery> {
-    if spec.random_generators.is_empty() {
-        return Vec::new();
+/// The default generator pipeline derived from a [`CampaignSpec`]: the fixed
+/// corpus, one schema-aware generator per `random` spec, and a single mutation
+/// generator when any `random` spec enables `mutate_on_finding`.
+fn default_generators(spec: &CampaignSpec) -> Vec<Box<dyn QueryGenerator>> {
+    let mut generators: Vec<Box<dyn QueryGenerator>> = Vec::new();
+    if !spec.corpus.is_empty() {
+        generators.push(Box::new(CorpusGenerator::new(spec.corpus.clone())));
     }
-    let generator = crate::SchemaAwareGenerator::new(
-        snapshot
-            .tables
-            .iter()
-            .map(|(name, table)| (name.as_str(), &table.schema)),
-    );
-    spec.random_generators
+    for random in &spec.random_generators {
+        generators.push(Box::new(RandomQueryGenerator::new(*random)));
+    }
+    if let Some(random) = spec
+        .random_generators
         .iter()
-        .flat_map(|generator_spec| {
-            generator.generate(
-                generator_spec.seed,
-                generator_spec.count,
-                generator_spec.nondeterministic,
-            )
-        })
-        .collect()
+        .find(|random| random.mutate_on_finding)
+    {
+        generators.push(Box::new(MutationGenerator::new(
+            random.mutations_per_finding,
+            random.seed ^ 0x5F4D_C0DE,
+        )));
+    }
+    generators
 }
 
 fn oracle_name(spec: &CampaignSpec) -> Result<&str> {

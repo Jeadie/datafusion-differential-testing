@@ -23,8 +23,14 @@
 //! the fact.
 
 use arrow::datatypes::{DataType, SchemaRef};
+use async_trait::async_trait;
 
-use crate::{rng::Rng, GeneratedQuery, Ordering, QueryProvenance};
+use crate::{
+    error::Result,
+    generator::{GenerationContext, GenerationStep, QueryGenerator},
+    rng::Rng,
+    GeneratedQuery, Ordering, QueryProvenance, RandomGeneratorSpec,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColumnKind {
@@ -348,6 +354,49 @@ fn join_key(rng: &mut Rng, left: &Table, right: &Table) -> Option<(String, Strin
 
 fn quote(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// A [`QueryGenerator`] that emits a schema-aware batch once. It builds its
+/// queries from [`GenerationContext::schema`], so it needs no schema up front.
+pub struct RandomQueryGenerator {
+    spec: RandomGeneratorSpec,
+    emitted: bool,
+}
+
+impl RandomQueryGenerator {
+    #[must_use]
+    pub fn new(spec: RandomGeneratorSpec) -> Self {
+        Self {
+            spec,
+            emitted: false,
+        }
+    }
+}
+
+#[async_trait]
+impl QueryGenerator for RandomQueryGenerator {
+    fn name(&self) -> &str {
+        "random"
+    }
+
+    async fn generate(&mut self, context: &GenerationContext<'_>) -> Result<GenerationStep> {
+        if self.emitted {
+            return Ok(GenerationStep::Finished);
+        }
+        self.emitted = true;
+        let generator = SchemaAwareGenerator::new(
+            context
+                .schema
+                .iter()
+                .map(|table| (table.name.as_str(), &table.schema)),
+        );
+        let count = self.spec.count.min(context.remaining_queries);
+        Ok(GenerationStep::Queries(generator.generate(
+            self.spec.seed,
+            count,
+            self.spec.nondeterministic,
+        )))
+    }
 }
 
 #[cfg(test)]

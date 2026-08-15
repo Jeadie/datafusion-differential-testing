@@ -9,16 +9,66 @@
 //! mutant never *adds* a `LIMIT` (which would introduce non-determinism); it only
 //! edits one already present.
 
+use async_trait::async_trait;
 use datafusion::sql::parser::DFParser;
 
-use crate::rng::Rng;
+use crate::{
+    error::Result,
+    generator::{GenerationContext, GenerationStep, QueryGenerator},
+    rng::Rng,
+    GeneratedQuery, Ordering, QueryProvenance,
+};
 
 const COMPARISONS: [&str; 6] = [" <> ", " <= ", " >= ", " = ", " < ", " > "];
 const AGGREGATES: [&str; 5] = ["count(", "sum(", "min(", "max(", "avg("];
 
+/// A [`QueryGenerator`] that mutates the previous round's findings into nearby
+/// variants (feedback-directed fuzzing). It never reports `Finished`, since a
+/// later round may surface new findings to mutate; the campaign stops it when a
+/// whole round produces no new queries.
+pub struct MutationGenerator {
+    per_finding: usize,
+    rng: Rng,
+}
+
+impl MutationGenerator {
+    #[must_use]
+    pub fn new(per_finding: usize, seed: u64) -> Self {
+        Self {
+            per_finding,
+            rng: Rng::new(seed),
+        }
+    }
+}
+
+#[async_trait]
+impl QueryGenerator for MutationGenerator {
+    fn name(&self) -> &str {
+        "mutation"
+    }
+
+    async fn generate(&mut self, context: &GenerationContext<'_>) -> Result<GenerationStep> {
+        let mut queries = Vec::new();
+        for finding in context.new_findings {
+            for sql in mutate(&finding.sql, &mut self.rng, self.per_finding) {
+                queries.push(GeneratedQuery {
+                    sql,
+                    ordering: Ordering::Detect,
+                    provenance: QueryProvenance {
+                        generator: "mutation".to_owned(),
+                        source: Some(finding.sql.clone()),
+                        provided_id: None,
+                    },
+                });
+            }
+        }
+        Ok(GenerationStep::Queries(queries))
+    }
+}
+
 /// Produce up to `count` distinct, parseable mutations of `sql`.
 #[must_use]
-pub fn mutate(sql: &str, rng: &mut Rng, count: usize) -> Vec<String> {
+pub(crate) fn mutate(sql: &str, rng: &mut Rng, count: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut attempts = 0;
     let budget = count.saturating_mul(8).max(8);

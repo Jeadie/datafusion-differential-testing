@@ -8,19 +8,22 @@ pub mod error;
 pub mod generator;
 pub mod id;
 pub mod model;
-mod mutate;
+pub mod mutate;
 pub mod provider;
 pub mod random_generator;
 mod rng;
 pub mod session;
 
-pub use artifact::{ArtifactStore, FileArtifactStore};
-pub use campaign::{CampaignRunner, RunReport};
+pub use artifact::{ArtifactStore, FileArtifactStore, NullArtifactStore};
+pub use campaign::{ArtifactStoreFactory, CampaignRunner, GeneratorFactory, RunReport};
 pub use compare::{Comparator, StrictComparator};
 pub use dataset::{DatasetSnapshot, SnapshotBuilder, TableSnapshot};
 pub use error::{Error, Result};
-pub use generator::{CorpusGenerator, GenerationStep, QueryGenerator};
-pub use random_generator::SchemaAwareGenerator;
+pub use generator::{
+    CorpusGenerator, GenerationContext, GenerationStep, QueryGenerator, TableSchema,
+};
+pub use mutate::MutationGenerator;
+pub use random_generator::{RandomQueryGenerator, SchemaAwareGenerator};
 pub use id::*;
 pub use model::*;
 pub use provider::*;

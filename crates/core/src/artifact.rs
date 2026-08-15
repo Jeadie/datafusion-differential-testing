@@ -87,6 +87,43 @@ impl ArtifactStore for FileArtifactStore {
     }
 }
 
+/// An [`ArtifactStore`] that discards everything. Useful for library use where
+/// findings are consumed from the returned [`RunReport`](crate::RunReport)
+/// rather than from disk.
+#[derive(Debug, Clone)]
+pub struct NullArtifactStore {
+    root: PathBuf,
+}
+
+impl NullArtifactStore {
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl ArtifactStore for NullArtifactStore {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn initialize(&self, _manifest: &RunManifest) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_dataset_manifest(&self, _snapshot: &DatasetSnapshot) -> Result<()> {
+        Ok(())
+    }
+
+    fn write_finding(&self, finding: &Finding) -> Result<PathBuf> {
+        Ok(self.root.join("findings").join(format!("{}.json", finding.id)))
+    }
+
+    fn write_summary(&self, _summary: &serde_json::Value) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn create_exclusive(path: &Path) -> Result<()> {
     fs::create_dir(path).map_err(|source| Error::Artifact {
         path: path.to_path_buf(),
