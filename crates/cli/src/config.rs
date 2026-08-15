@@ -155,6 +155,9 @@ pub enum GeneratorConfig {
     Random {
         seed: Option<u64>,
         count: usize,
+        #[serde(default)]
+        mutate_on_finding: bool,
+        mutations_per_finding: Option<usize>,
     },
 }
 
@@ -319,9 +322,20 @@ impl Config {
         let mut random_generators = Vec::new();
         for generator in self.generators {
             match generator {
-                GeneratorConfig::Random { seed, count } => {
+                GeneratorConfig::Random {
+                    seed,
+                    count,
+                    mutate_on_finding,
+                    mutations_per_finding,
+                } => {
                     if count == 0 {
                         return Err("random generator `count` must be positive".to_owned());
+                    }
+                    let mutations_per_finding = mutations_per_finding.unwrap_or(4);
+                    if mutate_on_finding && mutations_per_finding == 0 {
+                        return Err(
+                            "random generator `mutations_per_finding` must be positive".to_owned(),
+                        );
                     }
                     // No seed => exploratory mode: pick a fresh seed each run and
                     // let the generator use the noisier query shapes. An explicit
@@ -334,6 +348,8 @@ impl Config {
                         seed,
                         count,
                         nondeterministic,
+                        mutate_on_finding,
+                        mutations_per_finding,
                     });
                 }
                 GeneratorConfig::Corpus { paths, sql } => {
@@ -763,6 +779,56 @@ generators:
         assert_eq!(spec.random_generators[0].count, 42);
         // An explicit seed selects the reproducible, sound mode.
         assert!(!spec.random_generators[0].nondeterministic);
+    }
+
+    #[test]
+    fn random_generator_parses_mutation_options() {
+        let yaml = r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: random
+    seed: 1
+    count: 10
+    mutate_on_finding: true
+    mutations_per_finding: 8
+"#;
+        let spec = spec_from(yaml);
+        assert!(spec.random_generators[0].mutate_on_finding);
+        assert_eq!(spec.random_generators[0].mutations_per_finding, 8);
+    }
+
+    #[test]
+    fn random_generator_mutation_defaults_off() {
+        let yaml = r#"name: t
+dataset:
+  paths:
+    - fixtures/data.sql
+variants:
+  oracle:
+    oracle: true
+    tables:
+      "*": memtable
+  candidate:
+    tables:
+      "*": memtable
+generators:
+  - type: random
+    seed: 1
+    count: 10
+"#;
+        let spec = spec_from(yaml);
+        assert!(!spec.random_generators[0].mutate_on_finding);
+        assert_eq!(spec.random_generators[0].mutations_per_finding, 4);
     }
 
     #[test]

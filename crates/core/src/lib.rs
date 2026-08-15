@@ -8,8 +8,10 @@ pub mod error;
 pub mod generator;
 pub mod id;
 pub mod model;
+mod mutate;
 pub mod provider;
 pub mod random_generator;
+mod rng;
 pub mod session;
 
 pub use artifact::{ArtifactStore, FileArtifactStore};

@@ -139,6 +139,11 @@ pub struct RandomGeneratorSpec {
     pub seed: u64,
     pub count: usize,
     pub nondeterministic: bool,
+    /// When true, a generated query that produces a finding is mutated into
+    /// nearby variants (feedback-directed fuzzing), which are queued and run.
+    pub mutate_on_finding: bool,
+    /// How many mutants to enqueue per finding-producing query.
+    pub mutations_per_finding: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

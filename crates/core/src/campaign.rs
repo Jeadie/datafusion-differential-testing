@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -287,10 +287,19 @@ impl CampaignRunner {
             .collect();
 
         // Schema-aware generators run here, once the canonical snapshot (and thus
-        // every table schema) exists. Generated queries follow the fixed corpus.
+        // every table schema) exists. Corpus and generated queries seed a work
+        // queue; with feedback mutation on, a finding-producing query pushes
+        // nearby variants onto the queue so the run digs around the failure.
         let generated = generate_random_queries(&spec, &snapshot);
-        let all_queries: Vec<&crate::GeneratedQuery> =
-            spec.corpus.iter().chain(generated.iter()).collect();
+        let mut queue: VecDeque<crate::GeneratedQuery> =
+            spec.corpus.iter().cloned().chain(generated).collect();
+        let mut enqueued: HashSet<String> = queue.iter().map(|query| query.sql.clone()).collect();
+        let mutation = spec
+            .random_generators
+            .iter()
+            .find(|generator| generator.mutate_on_finding)
+            .map(|generator| (generator.mutations_per_finding, generator.seed ^ 0x5F4D_C0DE));
+        let mut mutation_rng = mutation.map(|(_, seed)| crate::rng::Rng::new(seed));
 
         let mut report = RunReport {
             run_id,
@@ -300,26 +309,28 @@ impl CampaignRunner {
             oracle_rejections: 0,
             findings: Vec::new(),
         };
-        for (query_index, query) in all_queries
-            .iter()
-            .copied()
-            .take(spec.limits.max_queries)
-            .enumerate()
-        {
-            report.generated_queries += 1;
+        let mut query_index = 0;
+        while let Some(query) = queue.pop_front() {
+            if query_index >= spec.limits.max_queries {
+                break;
+            }
             let query_id = QueryId::new(format!("query-{query_index:06}"))?;
-            let oracle_outcome = execute_query(oracle, query, spec.limits.query_timeout).await;
+            query_index += 1;
+            report.generated_queries += 1;
+            let oracle_outcome = execute_query(oracle, &query, spec.limits.query_timeout).await;
             if !matches!(oracle_outcome, QueryOutcome::Success(_)) {
                 report.oracle_rejections += 1;
                 continue;
             }
             report.executed_queries += 1;
+            let mut query_produced_finding = false;
             for (candidate_name, candidate) in &candidates {
-                let outcome = execute_query(candidate, query, spec.limits.query_timeout).await;
+                let outcome = execute_query(candidate, &query, spec.limits.query_timeout).await;
                 if let Comparison::Different(difference) =
                     self.comparator
                         .compare(&oracle_outcome, &outcome, query.is_ordered())
                 {
+                    query_produced_finding = true;
                     let finding_index = report.findings.len();
                     let finding = Finding {
                         id: FindingId::new(format!("finding-{finding_index:06}"))?,
@@ -335,6 +346,28 @@ impl CampaignRunner {
                         || spec.limits.stop_on_finding
                     {
                         break;
+                    }
+                }
+            }
+            // Feedback: enqueue mutants of the query that just found something.
+            if query_produced_finding {
+                if let (Some((per_finding, _)), Some(rng)) = (mutation, mutation_rng.as_mut()) {
+                    for sql in crate::mutate::mutate(&query.sql, rng, per_finding) {
+                        if enqueued.insert(sql.clone()) {
+                            queue.push_back(crate::GeneratedQuery {
+                                sql,
+                                ordering: crate::Ordering::Detect,
+                                provenance: crate::QueryProvenance {
+                                    generator: "mutation".to_owned(),
+                                    source: query
+                                        .provenance
+                                        .provided_id
+                                        .clone()
+                                        .or_else(|| Some(query.sql.clone())),
+                                    provided_id: None,
+                                },
+                            });
+                        }
                     }
                 }
             }
