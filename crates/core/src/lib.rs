@@ -1,4 +1,5 @@
-//! Extensible differential testing for DataFusion.
+//! Differential correctness testing for [`datafusion::catalog::TableProvider`] `SessionContext` and `TableProviders`.
+//!
 
 pub mod artifact;
 pub mod campaign;
@@ -22,9 +23,9 @@ pub use error::{Error, Result};
 pub use generator::{
     CorpusGenerator, GenerationContext, GenerationStep, QueryGenerator, TableSchema,
 };
-pub use mutate::MutationGenerator;
-pub use random_generator::{RandomQueryGenerator, SchemaAwareGenerator};
 pub use id::*;
 pub use model::*;
+pub use mutate::MutationGenerator;
 pub use provider::*;
+pub use random_generator::{RandomQueryGenerator, SchemaAwareGenerator};
 pub use session::{SessionExtension, SessionExtensionRegistry};

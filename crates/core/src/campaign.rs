@@ -24,7 +24,7 @@ use crate::{
     Finding, FindingId, GeneratedQuery, LogicalTableName, MutationGenerator, ProviderInstance,
     ProviderLifecycle, ProviderRegistry, QueryGenerator, QueryId, QueryOutcome, QueryResult,
     RandomQueryGenerator, RemoteTableRef, RunId, RunManifest, SessionExtensionRegistry,
-    TableBinding, TableSelection, TableSource, VariantId, VariantSpec,
+    SessionExtensionSpec, TableBinding, TableSelection, TableSource, VariantId, VariantSpec,
 };
 use futures::stream;
 
@@ -182,15 +182,15 @@ impl CampaignRunner {
                     message: error.to_string(),
                 }
             })?;
-            for extension in &variant.session.extensions {
+            for SessionExtensionSpec { kind, params } in &variant.session.extensions {
                 let implementation =
                     self.extensions
-                        .get(&extension.kind)
+                        .get(&kind)
                         .ok_or_else(|| Error::Configuration {
                             path: format!("variants.{name}.session.extensions"),
-                            message: format!("extension `{}` is not registered", extension.kind),
+                            message: format!("extension `{}` is not registered", kind),
                         })?;
-                implementation.validate(&extension.params)?;
+                implementation.validate(&params)?;
             }
             for binding in variant.tables.values() {
                 if let TableBinding::Provider { instance, .. } = binding {
@@ -493,8 +493,9 @@ impl CampaignRunner {
                     let variant = &spec.variants[variant_name];
                     let (remote, instance) = resolve_variant_binding(variant, table)?;
                     let targets = vec![(table.clone(), remote, instance)];
-                    let (table_schemas, table_batches) =
-                        self.snapshot_variant_tables(variant, &targets, providers).await?;
+                    let (table_schemas, table_batches) = self
+                        .snapshot_variant_tables(variant, &targets, providers)
+                        .await?;
                     for (name, schema) in table_schemas {
                         if schemas.contains_key(&name) {
                             return Err(Error::Dataset {

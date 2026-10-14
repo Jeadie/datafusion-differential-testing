@@ -292,25 +292,49 @@ fn open_connection(path: &std::path::Path, read_only: bool) -> duckdb::Result<Co
     }
 }
 
-fn duckdb_type(data_type: &DataType) -> std::result::Result<&'static str, &'static str> {
-    match data_type {
-        DataType::Boolean => Ok("BOOLEAN"),
-        DataType::Int8 => Ok("TINYINT"),
-        DataType::Int16 => Ok("SMALLINT"),
-        DataType::Int32 => Ok("INTEGER"),
-        DataType::Int64 => Ok("BIGINT"),
-        DataType::UInt8 => Ok("UTINYINT"),
-        DataType::UInt16 => Ok("USMALLINT"),
-        DataType::UInt32 => Ok("UINTEGER"),
-        DataType::UInt64 => Ok("UBIGINT"),
-        DataType::Float32 => Ok("FLOAT"),
-        DataType::Float64 => Ok("DOUBLE"),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("VARCHAR"),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Ok("BLOB"),
-        DataType::Date32 | DataType::Date64 => Ok("DATE"),
-        DataType::Timestamp(_, _) => Ok("TIMESTAMP"),
-        _ => Err("DuckDB adapter does not support this Arrow type"),
-    }
+fn duckdb_type(data_type: &DataType) -> std::result::Result<String, String> {
+    let text = match data_type {
+        DataType::Boolean => "BOOLEAN".to_owned(),
+        DataType::Int8 => "TINYINT".to_owned(),
+        DataType::Int16 => "SMALLINT".to_owned(),
+        DataType::Int32 => "INTEGER".to_owned(),
+        DataType::Int64 => "BIGINT".to_owned(),
+        DataType::UInt8 => "UTINYINT".to_owned(),
+        DataType::UInt16 => "USMALLINT".to_owned(),
+        DataType::UInt32 => "UINTEGER".to_owned(),
+        DataType::UInt64 => "UBIGINT".to_owned(),
+        DataType::Float32 => "FLOAT".to_owned(),
+        DataType::Float64 => "DOUBLE".to_owned(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "VARCHAR".to_owned(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BLOB".to_owned(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_owned(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_owned(),
+        // A DuckDB LIST maps to `<inner>[]`; nesting composes naturally.
+        DataType::List(field) | DataType::LargeList(field) => {
+            format!("{}[]", duckdb_type(field.data_type())?)
+        }
+        // A DuckDB fixed-size ARRAY maps to `<inner>[N]`.
+        DataType::FixedSizeList(field, len) => {
+            format!("{}[{len}]", duckdb_type(field.data_type())?)
+        }
+        // A DuckDB STRUCT lists its named members.
+        DataType::Struct(fields) => {
+            let members = fields
+                .iter()
+                .map(|field| {
+                    Ok(format!(
+                        "{} {}",
+                        quote(field.name()),
+                        duckdb_type(field.data_type())?
+                    ))
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?
+                .join(", ");
+            format!("STRUCT({members})")
+        }
+        other => return Err(format!("DuckDB adapter does not support Arrow type {other:?}")),
+    };
+    Ok(text)
 }
 
 fn validate_params(params: &UnresolvedParams, allowed_key: &str) -> Result<()> {

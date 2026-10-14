@@ -73,11 +73,15 @@ fn compare_successes(oracle: &QueryResult, candidate: &QueryResult, ordered: boo
         }
         (Ok(_), Ok(_)) => difference(
             FindingKind::RowMismatch,
-            if ordered {
-                "ordered rows differ".to_owned()
-            } else {
-                "unordered row multisets differ".to_owned()
-            },
+            format!(
+                "{}\n{}",
+                if ordered {
+                    "ordered rows differ"
+                } else {
+                    "unordered row multisets differ"
+                },
+                sample_diff(&oracle.batches, &candidate.batches),
+            ),
         ),
         (Err(message), _) | (_, Err(message)) => difference(FindingKind::RowMismatch, message),
     }
@@ -110,6 +114,35 @@ fn multiset(rows: &[Vec<u8>]) -> BTreeMap<&[u8], usize> {
         *counts.entry(row.as_slice()).or_default() += 1;
     }
     counts
+}
+
+/// Render a bounded, side-by-side preview of the oracle and candidate results so
+/// row-mismatch findings carry the actual differing values, not just a verdict.
+fn sample_diff(oracle: &[RecordBatch], candidate: &[RecordBatch]) -> String {
+    const MAX_ROWS: usize = 20;
+    fn render(batches: &[RecordBatch]) -> String {
+        let limited: Vec<RecordBatch> = {
+            let mut taken = 0usize;
+            let mut out = Vec::new();
+            for batch in batches {
+                if taken >= MAX_ROWS {
+                    break;
+                }
+                let take = (MAX_ROWS - taken).min(batch.num_rows());
+                out.push(batch.slice(0, take));
+                taken += take;
+            }
+            out
+        };
+        arrow::util::pretty::pretty_format_batches(&limited)
+            .map(|d| d.to_string())
+            .unwrap_or_else(|error| format!("<unrenderable: {error}>"))
+    }
+    format!(
+        "  oracle (first {MAX_ROWS} rows):\n{}\n  candidate (first {MAX_ROWS} rows):\n{}",
+        render(oracle),
+        render(candidate)
+    )
 }
 
 fn difference(kind: FindingKind, message: String) -> Comparison {
