@@ -519,6 +519,8 @@ mod tests {
             "sqlite::memory:".to_owned(),
             "fast=duckdb::memory:".to_owned(),
             "profile:///etc/p/sf_shop.toml".to_owned(),
+            "./libmy_driver.so:file.db".to_owned(),
+            "pg=postgresql://user@host/db".to_owned(),
         ];
         let variants = VariantArgs {
             variants: &args,
@@ -530,7 +532,7 @@ mod tests {
             .iter()
             .map(|variant| variant.name.as_str())
             .collect();
-        assert_eq!(names, ["sqlite", "fast", "sf_shop"]);
+        assert_eq!(names, ["sqlite", "fast", "sf_shop", "my_driver", "pg"]);
     }
 
     #[test]

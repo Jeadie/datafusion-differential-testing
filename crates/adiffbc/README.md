@@ -28,7 +28,7 @@ Differential testing for arbitrary [ADBC](https://arrow.apache.org/adbc/) driver
 
 Use `--format json` for machine-readable output. See `adiffbc run --help`.
 
-## Variants
+### Variants
 
 A variant is one database connection, written as `[NAME=]DRIVER:URI` or
 `[NAME=]profile://PROFILE`. Without `NAME=`, the name is the driver or
@@ -50,7 +50,7 @@ profile name. Names must be unique, so name variants that share a driver.
 example, `flightsql://host:port` sends `flightsql://host:port`, which the
 Flight SQL driver does not accept. Use `flightsql:grpc://host:port`.
 
-### Options
+#### Options
 Driver options in `adiffbc` are the ADBC option key-values. 
 
 - `-o NAME.KEY=VALUE`: an ADBC database option for variant `NAME`.
@@ -70,7 +70,7 @@ adiffbc run \
 
 Here `serial` and `parallel` both get `adbc.connection.autocommit=true`.
 
-### Profiles
+#### Profiles
 
 `adiffbc` supports [ADBC connection profiles](https://arrow.apache.org/adbc/current/format/connection_profiles.html)
 (`profile://NAME`). A profile keeps a driver and its options in a TOML file,
@@ -79,13 +79,13 @@ because command lines can appear in `ps` output and shell history.
 `adiffbc` stops with an error if a profile uses an environment variable
 that is not set.
 
-## Queries
+### Queries
 
 - `--queries FILE...` (`-q`): query files, one query per file. A quoted glob
   such as `'queries/*.sql'` is expanded in sorted order.
 - `-e SQL`: an inline query. Inline queries run after the query files.
 
-## Setup SQL
+### Setup SQL
 
 `--setup FILE` runs on every variant. `--setup NAME=FILE` runs on variant
 `NAME` only. Use this when the variants need different SQL to create the

@@ -17,18 +17,44 @@ use crate::{
 };
 
 const VARIANT_HELP: &str = "\
-A variant is an ADBC driver URI or connection profile, optionally named NAME=:
-  sqlite::memory:                     driver `sqlite`, uri `:memory:`
-  flightsql:grpc://localhost:50051    driver `flightsql`, uri `grpc://localhost:50051`
-  postgresql://user@host/db           driver `postgresql`, the whole URI is the uri
-  datafusion                          driver `datafusion`, no uri
-  sqlite@1.11.0::memory:              pin a driver version (installed separately)
-  ./libmy_driver.so:file.db           a driver library or manifest path
-  pg=profile://staging                an ADBC profile, named `pg`
-Missing drivers are installed with dbc (https://docs.columnar.tech/dbc/).";
+A variant is `[NAME=]DRIVER:URI` or `[NAME=]profile://PROFILE`. Without `NAME=`, the
+name is the driver or profile name. Names must be unique.
+
+  VARIANT                            NAME         DRIVER          URI OPTION
+  sqlite::memory:                    sqlite       sqlite          :memory:
+  flightsql:grpc://localhost:50051   flightsql    flightsql       grpc://localhost:50051
+  pg=postgresql://user@host/db       pg           postgresql      postgresql://user@host/db
+  datafusion                         datafusion   datafusion      (none)
+  old=sqlite@1.11.0::memory:         old          sqlite 1.11.0   :memory:
+  ./libmy_driver.so:file.db          my_driver    that library    file.db
+  profile://staging                  staging      from profile    from profile
+
+`DRIVER://...` sends the whole URI, and `DRIVER:REST` sends only `REST`. Use
+`flightsql:grpc://host:port`, not `flightsql://host:port`.
+
+`profile://PROFILE` loads an ADBC connection profile: a TOML file with a driver and
+its options, which can read environment variables. adiffbc stops if a variable that
+a profile uses is not set.
+
+A library path uses the driver's default entrypoint name. For a driver with another
+entrypoint, such as DuckDB, give its `.toml` manifest, or let dbc install it.
+
+Drivers are searched for in `$ADBC_DRIVER_PATH`, `--install-dir`,
+`$VIRTUAL_ENV/etc/adbc/drivers`, `$CONDA_PREFIX/etc/adbc/drivers`, and then the ADBC
+user and system directories. A driver that is not found is installed with dbc
+(https://docs.columnar.tech/dbc/), unless `--no-install` is set. A pinned driver
+(`DRIVER@1.2.3`, or a range such as `'DRIVER@>=1.4,<2'`) always goes through dbc,
+into its own directory.";
+
+const SHORT_HELP_POINTER: &str = "See `--help` for variant syntax and how drivers are found.";
+
+const TOP_LEVEL_HELP: &str = "\
+Example:
+  adiffbc run --oracle sqlite::memory: --candidate duckdb::memory: -q 'queries/*.sql'
+See `adiffbc run --help` for variant syntax and how drivers are found.";
 
 #[derive(Debug, Parser)]
-#[command(name = "adiffbc", version, about)]
+#[command(name = "adiffbc", version, about, after_help = TOP_LEVEL_HELP)]
 struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Human)]
     format: OutputFormat,
@@ -45,11 +71,11 @@ enum OutputFormat {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run queries on an oracle and candidates, and report differences.
-    /// Exits with 1 when there are findings.
-    #[command(after_help = VARIANT_HELP)]
+    /// Exits with 1 when there are findings, and 2 on an error.
+    #[command(after_help = SHORT_HELP_POINTER, after_long_help = VARIANT_HELP)]
     Run(RunArgs),
     /// Load (and install) drivers, connect, and print driver info.
-    #[command(after_help = VARIANT_HELP)]
+    #[command(after_help = SHORT_HELP_POINTER, after_long_help = VARIANT_HELP)]
     Probe {
         /// `[NAME=]URI` of each variant to probe.
         #[arg(required = true, value_name = "[NAME=]URI")]
@@ -75,7 +101,7 @@ struct RunArgs {
     #[arg(short = 'e', long = "execute", value_name = "SQL")]
     execute: Vec<String>,
     /// Query files, one query per file. Takes several files, and expands
-    /// quoted globs: `--queries 'queries/*.sql'`. Repeatable.
+    /// quoted globs in sorted order: `--queries 'queries/*.sql'`. Repeatable.
     #[arg(short = 'q', long, value_name = "FILE", num_args = 1..)]
     queries: Vec<String>,
     #[arg(long, value_enum, default_value_t = SchemaComparison::Relaxed)]
@@ -93,18 +119,20 @@ struct RunArgs {
 #[derive(Debug, Args)]
 struct DriverArgs {
     /// An ADBC database option for variant NAME, or `*` for all. Repeatable;
-    /// later values win, and override the URI and profile.
+    /// later values win, and override the URI and profile. Keys are not
+    /// checked by adiffbc; most drivers reject unknown keys.
     #[arg(short = 'o', long = "option", value_name = "NAME.KEY=VALUE")]
     database_options: Vec<String>,
     /// An ADBC connection option for variant NAME, or `*` for all. Repeatable.
+    /// Keys are not checked by adiffbc; most drivers reject unknown keys.
     #[arg(short = 'c', long = "connection-option", value_name = "NAME.KEY=VALUE")]
     connection_options: Vec<String>,
     /// Never install a missing driver.
     #[arg(long)]
     no_install: bool,
-    /// Where dbc installs drivers [default: the user cache directory].
-    #[arg(long, value_name = "DIR")]
-    install_dir: Option<PathBuf>,
+    /// Where dbc installs drivers.
+    #[arg(long, value_name = "DIR", default_value_os_t = spec::default_install_directory())]
+    install_dir: PathBuf,
     /// The dbc command line, e.g. "uvx dbc" [default: dbc, uvx dbc, or pipx run dbc].
     #[arg(long, value_name = "COMMAND")]
     dbc: Option<String>,
@@ -112,12 +140,8 @@ struct DriverArgs {
 
 impl DriverArgs {
     fn resolution(&self) -> Result<DriverResolution, String> {
-        let directory = self
-            .install_dir
-            .clone()
-            .unwrap_or_else(spec::default_install_directory);
-        let directory = std::path::absolute(&directory)
-            .map_err(|error| format!("cannot resolve {}: {error}", directory.display()))?;
+        let directory = std::path::absolute(&self.install_dir)
+            .map_err(|error| format!("cannot resolve {}: {error}", self.install_dir.display()))?;
         let command = self
             .dbc
             .as_ref()
