@@ -13,8 +13,8 @@ use std::{
 use adbc_core::{
     error::Error as AdbcError,
     error::Status,
-    options::{AdbcVersion, InfoCode, OptionConnection, OptionDatabase, OptionValue},
-    Connection, Database, Driver, Statement, LOAD_FLAG_DEFAULT,
+    options::{AdbcVersion, InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionValue},
+    Connection, Database, Driver, Optionable, Statement, LOAD_FLAG_DEFAULT,
 };
 use adbc_driver_manager::{
     profile::{
@@ -29,13 +29,27 @@ use arrow::{
     error::ArrowError,
 };
 use datafusion_differential_testing::{
-    dataset::logical_hash, ExecutionError, QueryOutcome, QueryResult,
+    dataset::logical_hash, ExecutionError, QueryOutcome, QueryResult, TableSchema,
 };
 
 use crate::{
-    spec::{DriverResolution, DriverSource, DriverSpec, Locator, SchemaComparison, VariantSpec},
+    spec::{
+        DriverResolution, DriverSource, DriverSpec, Locator, SchemaComparison, TableSelection,
+        VariantSpec,
+    },
     sql::split_statements,
 };
+
+/// Catalogs and schemas that hold database metadata, not user tables.
+const SYSTEM_CATALOGS: [&str; 1] = ["system"];
+const SYSTEM_SCHEMAS: [&str; 2] = ["information_schema", "pg_catalog"];
+
+/// Where a discovered table is. `None` means the driver did not say.
+#[derive(Debug, Clone, Default)]
+struct TableLocation {
+    catalog: Option<String>,
+    db_schema: Option<String>,
+}
 
 /// An open connection for one variant.
 pub struct Session {
@@ -314,6 +328,148 @@ impl Session {
         }
         Ok(info)
     }
+
+    /// The tables and views in the connection's current catalog and schema,
+    /// with their Arrow schemas, sorted by name. Generated SQL uses unqualified
+    /// table names, so tables elsewhere are not usable. A driver that does not
+    /// report its current catalog or schema is not filtered on it.
+    pub fn tables(&self, selection: &TableSelection) -> Result<Vec<TableSchema>, String> {
+        let current = TableLocation {
+            catalog: self.current(OptionConnection::CurrentCatalog),
+            db_schema: self.current(OptionConnection::CurrentSchema),
+        };
+        let found = self.list_tables(&current)?;
+        let scope = match (&current.catalog, &current.db_schema) {
+            (Some(catalog), Some(db_schema)) => {
+                format!("catalog `{catalog}`, schema `{db_schema}`")
+            }
+            (Some(catalog), None) => format!("catalog `{catalog}`"),
+            (None, Some(db_schema)) => format!("schema `{db_schema}`"),
+            (None, None) => "any catalog".to_owned(),
+        };
+        let names: Vec<&String> = match selection {
+            TableSelection::All => found.keys().collect(),
+            TableSelection::Only(names) => {
+                let mut names: Vec<&String> = names.iter().collect();
+                names.sort();
+                names.dedup();
+                if let Some(missing) = names.iter().find(|name| !found.contains_key(**name)) {
+                    let known: Vec<&str> = found.keys().map(String::as_str).collect();
+                    return Err(format!(
+                        "table `{missing}` not found in {scope}; found: {}",
+                        if known.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            known.join(", ")
+                        }
+                    ));
+                }
+                names
+            }
+        };
+        if names.is_empty() {
+            return Err(format!(
+                "no tables found in {scope}; create them with `--setup FILE`"
+            ));
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                let location = &found[name];
+                let schema = self
+                    .connection
+                    .get_table_schema(
+                        location.catalog.as_deref(),
+                        location.db_schema.as_deref(),
+                        name,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "cannot read the schema of table `{name}`: {}",
+                            error.message
+                        )
+                    })?;
+                Ok(TableSchema {
+                    name: name.clone(),
+                    schema: Arc::new(schema),
+                })
+            })
+            .collect()
+    }
+
+    /// A connection option, or `None` if the driver does not support it.
+    fn current(&self, option: OptionConnection) -> Option<String> {
+        self.connection.get_option_string(option).ok()
+    }
+
+    /// Table names in `scope`, without system catalogs and schemas. When a
+    /// name is in more than one schema, the first one is kept.
+    fn list_tables(
+        &self,
+        scope: &TableLocation,
+    ) -> Result<BTreeMap<String, TableLocation>, String> {
+        let reader = self
+            .connection
+            .get_objects(
+                ObjectDepth::Tables,
+                scope.catalog.as_deref(),
+                scope.db_schema.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| format!("cannot list tables: {}", error.message))?;
+        let mut found = BTreeMap::new();
+        for batch in reader {
+            let batch = batch.map_err(|error| format!("cannot list tables: {error}"))?;
+            // ADBC GetObjects schema: catalog_name, then catalog_db_schemas:
+            // list<struct<db_schema_name, db_schema_tables: list<struct<table_name, ...>>>>.
+            let catalogs = batch.column(0).as_string::<i32>();
+            let catalog_schemas = batch.column(1).as_list::<i32>();
+            for row in 0..batch.num_rows() {
+                let catalog = catalogs.is_valid(row).then(|| catalogs.value(row));
+                if catalog.is_some_and(|name| is_one_of(name, &SYSTEM_CATALOGS))
+                    || catalog_schemas.is_null(row)
+                {
+                    continue;
+                }
+                let db_schemas = catalog_schemas.value(row);
+                let db_schemas = db_schemas.as_struct();
+                let db_schema_names = db_schemas.column(0).as_string::<i32>();
+                let db_schema_tables = db_schemas.column(1).as_list::<i32>();
+                for schema_row in 0..db_schemas.len() {
+                    let db_schema = db_schema_names
+                        .is_valid(schema_row)
+                        .then(|| db_schema_names.value(schema_row));
+                    if db_schema.is_some_and(|name| is_one_of(name, &SYSTEM_SCHEMAS))
+                        || db_schema_tables.is_null(schema_row)
+                    {
+                        continue;
+                    }
+                    let tables = db_schema_tables.value(schema_row);
+                    let table_names = tables.as_struct().column(0).as_string::<i32>();
+                    for table in table_names.iter().flatten() {
+                        found
+                            .entry(table.to_owned())
+                            .or_insert_with(|| TableLocation {
+                                catalog: catalog.map(str::to_owned),
+                                // SQLite reports its only schema as "".
+                                db_schema: db_schema
+                                    .filter(|name| !name.is_empty())
+                                    .map(str::to_owned),
+                            });
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+fn is_one_of(name: &str, names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 /// Drop top-level nullability and all metadata, so drivers that agree on

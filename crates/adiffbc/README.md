@@ -81,9 +81,60 @@ that is not set.
 
 ### Queries
 
-- `--queries FILE...` (`-q`): query files, one query per file. A quoted glob
-  such as `'queries/*.sql'` is expanded in sorted order.
+- `--queries FILE...` (`-q`): query files. A quoted glob such as
+  `'queries/*.sql'` is expanded in sorted order. `adiffbc` splits each file
+  at top-level `;`, so one file can hold many queries.
 - `-e SQL`: an inline query. Inline queries run after the query files.
+  `adiffbc` does not split an inline query.
+
+Each query has a name, and findings show this name. To set the name, put a
+`-- name: NAME` comment before the query. The comment stays in the SQL that
+goes to the drivers. Without this comment, the name is `FILE:N` for query
+`N` in a file (from 1), or `inline:N` for the `N`th `-e` query. Two queries
+cannot have the same name.
+
+In `queries/orders.sql`:
+
+```sql
+-- name: order_count
+SELECT count(*) FROM orders;
+
+-- The name of this query is queries/orders.sql:2.
+SELECT id FROM orders WHERE amount > 5 ORDER BY id;
+```
+
+### Random queries
+
+- `--random COUNT`: make `COUNT` random queries from the tables of the
+  oracle. `adiffbc` finds the tables after the setup SQL runs. It uses the
+  tables and views in the current catalog and schema of the oracle. It does
+  not use system schemas, for example `information_schema`.
+- `--tables TABLE...`: use only these tables. Each table must exist.
+- `--seed SEED`: the same seed gives the same queries. Without `--seed`,
+  `adiffbc` selects a seed, writes it to stderr, and sets `--exploratory`.
+- `--exploratory`: random queries can also use `LIMIT` and float
+  aggregates. These queries find more bugs, but correct drivers can also
+  give different results for them. Examine these findings carefully.
+- `--mutate`: when a query gives a finding, make small changes to it and
+  run the changed queries (mutants). This applies to all queries, not only
+  to random queries. `--mutations-per-finding COUNT` sets the number of
+  mutants for each finding (default 4).
+
+Query files and inline queries run first, then random queries, then
+mutants. `--max-queries` is the limit for all queries together. `adiffbc`
+does not run the same SQL text two times.
+
+A random query has the name `random-NNNNNN`. A mutant has the name of its
+source query and `+mN`, for example `random-000012+m1`.
+
+Put rows in the tables before you use `--random`. Some drivers get the
+column types from the data. For example, SQLite reports each column of an
+empty table as an integer column.
+
+```sh
+adiffbc run --oracle sqlite::memory: --candidate duckdb::memory: \
+  --setup fixtures.sql --random 200 --seed 42 --mutate
+```
 
 ### Setup SQL
 

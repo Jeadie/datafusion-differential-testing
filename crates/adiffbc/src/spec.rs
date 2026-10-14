@@ -1,11 +1,15 @@
 //! A validated campaign, and the parsers that build it from command-line text.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
+    fmt,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
 use datafusion_differential_testing::GeneratedQuery;
+
+use crate::sql::{split_statements, Comment, LeadingComments};
 
 /// How strictly result schemas are compared between the oracle and a candidate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
@@ -231,6 +235,60 @@ pub struct Limits {
     pub stop_on_finding: bool,
 }
 
+/// The seed of the random and mutation generators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seed {
+    /// From `--seed`.
+    Given(u64),
+    /// Picked at start because `--seed` was not given.
+    Entropy(u64),
+}
+
+impl Seed {
+    /// A seed from the clock and process id, for runs without `--seed`.
+    pub fn entropy() -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        Self::Entropy(nanos ^ (u64::from(std::process::id()) << 32))
+    }
+
+    pub fn value(self) -> u64 {
+        match self {
+            Self::Given(seed) | Self::Entropy(seed) => seed,
+        }
+    }
+}
+
+/// The tables that random queries use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableSelection {
+    /// Every table and view in the oracle's default schema.
+    All,
+    /// Only these tables (`--tables`). Each one must exist.
+    Only(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RandomQueries {
+    pub count: NonZeroUsize,
+    /// Also emit `LIMIT` and float aggregates. These reach more query shapes,
+    /// but correct engines can return different results for them.
+    pub exploratory: bool,
+    pub tables: TableSelection,
+}
+
+/// The generators that run after the corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    pub seed: Seed,
+    pub random: Option<RandomQueries>,
+    /// Mutants per finding, when `--mutate` is set.
+    pub mutations_per_finding: Option<NonZeroUsize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
     pub limits: Limits,
@@ -239,8 +297,11 @@ pub struct Spec {
     pub oracle: VariantSpec,
     /// Never empty.
     pub candidates: Vec<VariantSpec>,
-    /// Never empty.
+    /// Runs first. Each query's name is in `provenance.provided_id`. Empty
+    /// only when `generation` has random queries.
     pub corpus: Vec<GeneratedQuery>,
+    /// `None` when neither `--random` nor `--mutate` is set.
+    pub generation: Option<Generation>,
 }
 
 /// Which variants an `-o`/`-c` option applies to.
@@ -380,8 +441,83 @@ impl VariantArgs<'_> {
     }
 }
 
+/// Where a corpus query comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryLocation<'a> {
+    /// The 1-based statement number in a query file.
+    File { path: &'a str, statement: usize },
+    /// The 1-based position among `-e` values.
+    Inline { position: usize },
+}
+
+impl QueryLocation<'_> {
+    /// The name of a query without a `-- name:` comment.
+    fn default_name(self) -> String {
+        match self {
+            Self::File { path, statement } => format!("{path}:{statement}"),
+            Self::Inline { position } => format!("inline:{position}"),
+        }
+    }
+
+    fn source(self) -> Option<String> {
+        match self {
+            Self::File { path, .. } => Some(path.to_owned()),
+            Self::Inline { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for QueryLocation<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { path, statement } => write!(formatter, "{path} statement {statement}"),
+            Self::Inline { position } => write!(formatter, "-e value {position}"),
+        }
+    }
+}
+
+/// The name in a `-- name: NAME` comment before the statement's SQL.
+fn query_name(statement: &str) -> Result<Option<&str>, String> {
+    let mut names = LeadingComments::new(statement).filter_map(|comment| match comment {
+        Comment::Line(text) => text.trim().strip_prefix("name:").map(str::trim),
+        Comment::Block(_) => None,
+    });
+    match (names.next(), names.next()) {
+        (Some(_), Some(_)) => Err("more than one `-- name:` comment".to_owned()),
+        (Some(""), None) => Err("empty `-- name:` comment".to_owned()),
+        (name, _) => Ok(name),
+    }
+}
+
+/// Collects corpus queries, and rejects two queries with one name.
+#[derive(Default)]
+struct Corpus {
+    queries: Vec<GeneratedQuery>,
+    /// Where each name was first used, for the duplicate error.
+    names: HashMap<String, String>,
+}
+
+impl Corpus {
+    fn push(&mut self, sql: &str, location: QueryLocation<'_>) -> Result<(), String> {
+        let name = query_name(sql)
+            .map_err(|error| format!("{location}: {error}"))?
+            .map_or_else(|| location.default_name(), str::to_owned);
+        if let Some(first) = self.names.get(&name) {
+            return Err(format!(
+                "two queries are named `{name}`: {first} and {location}"
+            ));
+        }
+        self.names.insert(name.clone(), location.to_string());
+        let mut query = GeneratedQuery::corpus(sql, location.source());
+        query.provenance.provided_id = Some(name);
+        self.queries.push(query);
+        Ok(())
+    }
+}
+
 /// Read query files in order, then inline queries. A file argument holding
-/// `*`, `?` or `[` is a glob, expanded in sorted order.
+/// `*`, `?` or `[` is a glob, expanded in sorted order. Files are split at
+/// top-level `;`; each `-e` value is one query.
 pub fn load_corpus(files: &[String], inline: &[String]) -> Result<Vec<GeneratedQuery>, String> {
     let mut paths = Vec::new();
     for file in files {
@@ -399,26 +535,32 @@ pub fn load_corpus(files: &[String], inline: &[String]) -> Result<Vec<GeneratedQ
         matches.sort();
         paths.extend(matches);
     }
-    let mut corpus = paths
-        .iter()
-        .map(|path| {
-            let sql = std::fs::read_to_string(path)
-                .map_err(|error| format!("cannot read query file {}: {error}", path.display()))?;
-            Ok(GeneratedQuery::corpus(
-                sql,
-                Some(path.display().to_string()),
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    corpus.extend(
-        inline
-            .iter()
-            .map(|sql| GeneratedQuery::corpus(sql.clone(), None)),
-    );
-    if corpus.is_empty() {
-        return Err("no queries: pass `--queries FILE` or `-e SQL`".to_owned());
+    let mut corpus = Corpus::default();
+    for path in &paths {
+        let path = path.display().to_string();
+        let script = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read query file {path}: {error}"))?;
+        let statements = split_statements(&script);
+        if statements.is_empty() {
+            return Err(format!("query file {path} holds no SQL statement"));
+        }
+        for (index, sql) in statements.into_iter().enumerate() {
+            let location = QueryLocation::File {
+                path: &path,
+                statement: index + 1,
+            };
+            corpus.push(sql, location)?;
+        }
     }
-    Ok(corpus)
+    for (index, sql) in inline.iter().enumerate() {
+        corpus.push(
+            sql,
+            QueryLocation::Inline {
+                position: index + 1,
+            },
+        )?;
+    }
+    Ok(corpus.queries)
 }
 
 /// The per-user cache directory for installed drivers.
@@ -556,6 +698,103 @@ mod tests {
         .parse()
         .unwrap_err();
         assert!(error.contains("no variant is named that"), "{error}");
+    }
+
+    #[test]
+    fn query_names_come_from_leading_name_comments() {
+        assert_eq!(query_name("-- name: totals\nSELECT 1"), Ok(Some("totals")));
+        assert_eq!(
+            query_name("  -- a note\n  --   name:   by day  \r\n/* x */ SELECT 1"),
+            Ok(Some("by day"))
+        );
+        assert_eq!(query_name("--name:x\nSELECT 1"), Ok(Some("x")));
+        assert_eq!(query_name("SELECT 1 -- name: late"), Ok(None));
+        assert_eq!(query_name("/* name: block */ SELECT 1"), Ok(None));
+        assert_eq!(query_name("-- names: x\nSELECT 1"), Ok(None));
+        assert!(query_name("-- name:  \nSELECT 1").is_err());
+        assert!(query_name("-- name: a\n-- name: b\nSELECT 1").is_err());
+    }
+
+    fn write(directory: &tempfile::TempDir, file: &str, sql: &str) -> String {
+        let path = directory.path().join(file);
+        std::fs::write(&path, sql).expect("write query file");
+        path.display().to_string()
+    }
+
+    fn names(corpus: &[GeneratedQuery]) -> Vec<&str> {
+        corpus
+            .iter()
+            .map(|query| query.provenance.provided_id.as_deref().unwrap_or("?"))
+            .collect()
+    }
+
+    #[test]
+    fn query_files_are_split_and_named() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = write(
+            &directory,
+            "q.sql",
+            "SELECT 1;\n-- name: totals\nSELECT count(*) FROM t;\n\nSELECT 'a;b';\n-- end\n",
+        );
+        let single = write(&directory, "one.sql", "SELECT 2\n");
+        let inline = [
+            "SELECT 3".to_owned(),
+            " -- name: three\nSELECT 3;".to_owned(),
+        ];
+        let corpus = load_corpus(&[file.clone(), single.clone()], &inline).expect("valid corpus");
+        assert_eq!(
+            names(&corpus),
+            [
+                format!("{file}:1").as_str(),
+                "totals",
+                &format!("{file}:3"),
+                &format!("{single}:1"),
+                "inline:1",
+                "three",
+            ]
+        );
+        let sql: Vec<_> = corpus.iter().map(|query| query.sql.as_str()).collect();
+        assert_eq!(
+            sql,
+            [
+                "SELECT 1",
+                "-- name: totals\nSELECT count(*) FROM t",
+                "SELECT 'a;b'",
+                "SELECT 2",
+                "SELECT 3",
+                " -- name: three\nSELECT 3;",
+            ]
+        );
+        assert_eq!(corpus[1].provenance.source.as_deref(), Some(file.as_str()));
+        assert_eq!(corpus[4].provenance.source, None);
+    }
+
+    #[test]
+    fn rejects_duplicate_names_and_empty_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = write(&directory, "q.sql", "SELECT 1;\n-- name: a\nSELECT 2;");
+        let error = load_corpus(
+            std::slice::from_ref(&file),
+            &["-- name: a\nSELECT 3".to_owned()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!("two queries are named `a`: {file} statement 2 and -e value 1")
+        );
+
+        let error = load_corpus(&[file.clone(), file.clone()], &[]).unwrap_err();
+        assert!(
+            error.contains(&format!("two queries are named `{file}:1`")),
+            "{error}"
+        );
+
+        let error = load_corpus(&[], &["-- name: \nSELECT 1".to_owned()]).unwrap_err();
+        assert_eq!(error, "-e value 1: empty `-- name:` comment");
+
+        let empty = write(&directory, "empty.sql", "-- nothing here\n;\n");
+        let error = load_corpus(&[empty], &[]).unwrap_err();
+        assert!(error.contains("holds no SQL statement"), "{error}");
     }
 
     #[test]

@@ -55,16 +55,52 @@ pub fn split_statements(script: &str) -> Vec<&str> {
 
 /// True when the statement holds only whitespace and comments.
 fn is_blank(statement: &str) -> bool {
-    let mut rest = statement.trim_start();
-    loop {
-        if let Some(after) = rest.strip_prefix("--") {
-            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
-        } else {
-            return rest.is_empty();
+    LeadingComments::new(statement).remainder().is_empty()
+}
+
+/// A comment before the first SQL token of a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comment<'a> {
+    /// The text after `--`, up to the end of the line.
+    Line(&'a str),
+    /// The text between `/*` and `*/`.
+    Block(&'a str),
+}
+
+/// The comments at the start of a statement, in order.
+#[derive(Debug, Clone)]
+pub struct LeadingComments<'a> {
+    rest: &'a str,
+}
+
+impl<'a> LeadingComments<'a> {
+    pub fn new(statement: &'a str) -> Self {
+        Self {
+            rest: statement.trim_start(),
         }
-        rest = rest.trim_start();
+    }
+
+    /// The statement after its leading comments and whitespace.
+    pub fn remainder(mut self) -> &'a str {
+        while self.next().is_some() {}
+        self.rest
+    }
+}
+
+impl<'a> Iterator for LeadingComments<'a> {
+    type Item = Comment<'a>;
+
+    fn next(&mut self) -> Option<Comment<'a>> {
+        let (comment, rest) = if let Some(after) = self.rest.strip_prefix("--") {
+            let (text, rest) = after.split_once('\n').unwrap_or((after, ""));
+            (Comment::Line(text), rest)
+        } else {
+            let after = self.rest.strip_prefix("/*")?;
+            let (text, rest) = after.split_once("*/").unwrap_or((after, ""));
+            (Comment::Block(text), rest)
+        };
+        self.rest = rest.trim_start();
+        Some(comment)
     }
 }
 
@@ -94,5 +130,24 @@ mod tests {
             vec!["SELECT 1", "SELECT 2"]
         );
         assert!(split_statements(" ;\n-- only a comment\n").is_empty());
+    }
+
+    #[test]
+    fn reads_leading_comments_and_the_rest() {
+        let statement = "  -- one\r\n/* two\n */ --three\nSELECT 1 -- not leading";
+        let comments: Vec<_> = LeadingComments::new(statement).collect();
+        assert_eq!(
+            comments,
+            [
+                Comment::Line(" one\r"),
+                Comment::Block(" two\n "),
+                Comment::Line("three"),
+            ]
+        );
+        assert_eq!(
+            LeadingComments::new(statement).remainder(),
+            "SELECT 1 -- not leading"
+        );
+        assert_eq!(LeadingComments::new("-- only").remainder(), "");
     }
 }
