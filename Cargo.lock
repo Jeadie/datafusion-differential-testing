@@ -50,9 +50,11 @@ dependencies = [
  "arrow",
  "clap",
  "datafusion-differential-testing",
+ "futures",
  "glob",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

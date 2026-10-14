@@ -6,14 +6,17 @@ mod run;
 mod spec;
 mod sql;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use datafusion_differential_testing::StrictComparator;
 
 use crate::{
     driver::{DriverLoader, Session},
-    spec::{DriverResolution, Limits, SchemaComparison, Spec, VariantArgs},
+    spec::{
+        DriverResolution, Generation, Limits, RandomQueries, SchemaComparison, Seed, Spec,
+        TableSelection, VariantArgs,
+    },
 };
 
 const VARIANT_HELP: &str = "\
@@ -86,6 +89,7 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("generators").args(["random", "mutate"]).multiple(true)))]
 struct RunArgs {
     /// The variant whose results are taken as correct.
     #[arg(long, value_name = "[NAME=]URI")]
@@ -97,15 +101,48 @@ struct RunArgs {
     /// Repeatable; runs in the given order. Split at top-level `;`.
     #[arg(long, value_name = "[NAME=]FILE")]
     setup: Vec<String>,
-    /// An inline query. Repeatable; runs after query files.
-    #[arg(short = 'e', long = "execute", value_name = "SQL")]
+    /// An inline query, not split. Repeatable; runs after query files. Its
+    /// name is `inline:N`, or the name in a `-- name: NAME` comment.
+    #[arg(
+        short = 'e',
+        long = "execute",
+        value_name = "SQL",
+        allow_hyphen_values = true
+    )]
     execute: Vec<String>,
-    /// Query files, one query per file. Takes several files, and expands
+    /// Query files, split at top-level `;`. Takes several files, and expands
     /// quoted globs in sorted order: `--queries 'queries/*.sql'`. Repeatable.
+    /// A query's name is `FILE:N` (its statement number), or the name in a
+    /// `-- name: NAME` comment before it. Names must be unique.
     #[arg(short = 'q', long, value_name = "FILE", num_args = 1..)]
     queries: Vec<String>,
+    /// Add COUNT random queries, made from the oracle's tables after setup.
+    /// They run after the query files and inline queries.
+    #[arg(long, value_name = "COUNT")]
+    random: Option<NonZeroUsize>,
+    /// Make random queries only from these tables. Each table must exist.
+    /// Default: all tables and views in the oracle's current schema.
+    #[arg(long, value_name = "TABLE", num_args = 1.., requires = "random")]
+    tables: Vec<String>,
+    /// The seed for `--random` and `--mutate`. The same seed gives the same
+    /// queries. Without it, adiffbc picks a seed, prints it, and sets
+    /// `--exploratory`.
+    #[arg(long, value_name = "SEED", requires = "generators")]
+    seed: Option<u64>,
+    /// Let random queries use `LIMIT` and float aggregates. These find more
+    /// bugs, but correct drivers can also return different results for them.
+    #[arg(long, requires = "random")]
+    exploratory: bool,
+    /// Change each query that gives a finding into nearby queries, and run
+    /// them. Applies to all queries, not only random ones.
+    #[arg(long)]
+    mutate: bool,
+    /// The number of changed queries to make from each finding.
+    #[arg(long, value_name = "COUNT", default_value = "4", requires = "mutate")]
+    mutations_per_finding: NonZeroUsize,
     #[arg(long, value_enum, default_value_t = SchemaComparison::Relaxed)]
     schema: SchemaComparison,
+    /// The maximum number of queries to run, from all sources together.
     #[arg(long, default_value_t = 1_000)]
     max_queries: usize,
     #[arg(long, default_value_t = 100)]
@@ -171,6 +208,25 @@ impl RunArgs {
             .collect();
         let mut variants = self.drivers.variants(&names, &self.setup)?.into_iter();
         let oracle = variants.next().ok_or("--oracle is required")?;
+        let corpus = spec::load_corpus(&self.queries, &self.execute)?;
+        if corpus.is_empty() && self.random.is_none() {
+            return Err(
+                "no queries: pass `--queries FILE`, `-e SQL` or `--random COUNT`".to_owned(),
+            );
+        }
+        let generation = (self.random.is_some() || self.mutate).then(|| Generation {
+            seed: self.seed.map_or_else(Seed::entropy, Seed::Given),
+            random: self.random.map(|count| RandomQueries {
+                count,
+                exploratory: self.exploratory || self.seed.is_none(),
+                tables: if self.tables.is_empty() {
+                    TableSelection::All
+                } else {
+                    TableSelection::Only(self.tables)
+                },
+            }),
+            mutations_per_finding: self.mutate.then_some(self.mutations_per_finding),
+        });
         Ok(Spec {
             limits: Limits {
                 max_queries: self.max_queries,
@@ -181,7 +237,8 @@ impl RunArgs {
             drivers: self.drivers.resolution()?,
             oracle,
             candidates: variants.collect(),
-            corpus: spec::load_corpus(&self.queries, &self.execute)?,
+            corpus,
+            generation,
         })
     }
 }
@@ -243,23 +300,49 @@ fn execute(command: Command, format: OutputFormat) -> Result<ExitCode, String> {
         }
         Command::Run(args) => {
             let spec = args.into_spec()?;
+            if let Some(Generation {
+                seed: Seed::Entropy(seed),
+                random,
+                ..
+            }) = &spec.generation
+            {
+                // Print before running, so the seed is known if the run fails.
+                let flags = if random.is_some() {
+                    format!("--seed {seed} --exploratory")
+                } else {
+                    format!("--seed {seed}")
+                };
+                eprintln!("seed: {seed} (no --seed given; to repeat this run, add `{flags}`)");
+            }
             let report = run::run(&spec, &StrictComparator::default())?;
             match format {
                 OutputFormat::Human => {
                     for finding in &report.findings {
                         println!(
-                            "finding: query #{} ({}) on `{}`: {:?}\n  sql: {}\n  {}",
-                            finding.query,
-                            finding.source.as_deref().unwrap_or("inline"),
+                            "finding: query `{}` on `{}`: {:?}\n  sql: {}\n  {}",
+                            finding.query.name,
                             finding.candidate,
                             finding.kind,
-                            finding.sql.trim(),
+                            finding.sql.trim().replace('\n', "\n       "),
                             finding.message.replace('\n', "\n  ")
                         );
                     }
+                    if let Some(generation) = &report.generation {
+                        if !generation.tables.is_empty() {
+                            eprintln!("random tables: {}", generation.tables.join(", "));
+                        }
+                    }
+                    let by_generator: Vec<String> = report
+                        .queries_by_generator
+                        .iter()
+                        .map(|(generator, count)| format!("{generator} {count}"))
+                        .collect();
                     eprintln!(
-                        "{} queries, {} oracle rejections, {} comparisons, {} findings",
+                        "{} queries ({}), {} duplicates skipped, {} oracle rejections, \
+                         {} comparisons, {} findings",
                         report.queries_executed,
+                        by_generator.join(", "),
+                        report.duplicate_queries,
                         report.oracle_rejections,
                         report.comparisons,
                         report.findings.len()
