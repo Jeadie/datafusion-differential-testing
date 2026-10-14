@@ -3,7 +3,10 @@
 use datafusion_differential_testing::{Comparator, Comparison, FindingKind, QueryOutcome};
 use serde::Serialize;
 
-use crate::{config::Spec, driver::Session};
+use crate::{
+    driver::{DriverLoader, Session},
+    spec::{Spec, VariantSpec},
+};
 
 #[derive(Debug, Serialize)]
 pub struct Finding {
@@ -30,14 +33,15 @@ struct Candidate {
 }
 
 pub fn run(spec: &Spec, comparator: &dyn Comparator) -> Result<Report, String> {
-    let mut oracle = open(spec, &spec.oracle)?;
+    let mut drivers = DriverLoader::new(&spec.drivers);
+    let mut oracle = open(&spec.oracle, &mut drivers)?;
     let mut candidates = spec
         .candidates
         .iter()
         .map(|variant| {
             Ok(Candidate {
                 name: variant.name.clone(),
-                session: open(spec, variant)?,
+                session: open(variant, &mut drivers)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -74,10 +78,10 @@ pub fn run(spec: &Spec, comparator: &dyn Comparator) -> Result<Report, String> {
     Ok(report)
 }
 
-/// Connect a variant and run the setup scripts on it.
-fn open(spec: &Spec, variant: &crate::config::VariantSpec) -> Result<Session, String> {
-    let mut session = Session::connect(variant)?;
-    for script in &spec.setup {
+/// Connect a variant and run its setup scripts.
+fn open(variant: &VariantSpec, drivers: &mut DriverLoader<'_>) -> Result<Session, String> {
+    let (mut session, _) = Session::connect(variant, drivers)?;
+    for script in &variant.setup {
         session.execute_script(&script.sql).map_err(|error| {
             format!(
                 "variant `{}`: setup `{}` failed: {error}",
