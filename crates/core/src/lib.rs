@@ -17,7 +17,7 @@ pub mod session;
 
 pub use artifact::{ArtifactStore, FileArtifactStore, NullArtifactStore};
 pub use campaign::{ArtifactStoreFactory, CampaignRunner, GeneratorFactory, RunReport};
-pub use compare::{Comparator, StrictComparator};
+pub use compare::{Comparator, StrictComparator, Ulps};
 pub use dataset::{DatasetSnapshot, SnapshotBuilder, TableSnapshot};
 pub use error::{Error, Result};
 pub use generator::{

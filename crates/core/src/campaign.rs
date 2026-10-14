@@ -85,7 +85,7 @@ impl CampaignRunner {
         Self {
             providers: ProviderRegistry::new(),
             extensions: SessionExtensionRegistry::new(),
-            comparator: Arc::new(StrictComparator),
+            comparator: Arc::new(StrictComparator::default()),
             generators: None,
             store_factory: None,
         }

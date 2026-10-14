@@ -243,7 +243,7 @@ fn execute(command: Command, format: OutputFormat) -> Result<ExitCode, String> {
         }
         Command::Run(args) => {
             let spec = args.into_spec()?;
-            let report = run::run(&spec, &StrictComparator)?;
+            let report = run::run(&spec, &StrictComparator::default())?;
             match format {
                 OutputFormat::Human => {
                     for finding in &report.findings {
