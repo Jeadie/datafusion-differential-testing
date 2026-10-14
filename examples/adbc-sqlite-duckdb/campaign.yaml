@@ -1,0 +1,36 @@
+# Compares the SQLite ADBC driver (oracle) with DuckDB's built-in ADBC driver.
+#
+#   export ADBC_SQLITE_DRIVER=/path/to/libadbc_driver_sqlite.so   # e.g. from the adbc-driver-sqlite wheel
+#   export ADBC_DUCKDB_DRIVER=/path/to/libduckdb.dylib            # e.g. /opt/homebrew/lib/libduckdb.dylib
+#   cargo run -p adiffbc -- run examples/adbc-sqlite-duckdb/campaign.yaml
+name: adbc-sqlite-duckdb
+
+setup:
+  paths:
+    - setup.sql
+
+campaign:
+  max_queries: 1000
+  max_findings: 100
+
+drivers:
+  sqlite:
+    driver: ${env:ADBC_SQLITE_DRIVER}
+  duckdb:
+    driver: ${env:ADBC_DUCKDB_DRIVER}
+    entrypoint: duckdb_adbc_init
+
+variants:
+  sqlite:
+    oracle: true
+    driver: sqlite
+    uri: ":memory:"
+  duckdb:
+    driver: duckdb
+    options:
+      path: ":memory:"
+
+generators:
+  - type: corpus
+    paths:
+      - queries/*.sql

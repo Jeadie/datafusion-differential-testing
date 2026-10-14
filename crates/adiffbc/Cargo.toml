@@ -1,0 +1,29 @@
+[package]
+name = "adiffbc"
+description = "Differential testing for arbitrary ADBC drivers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "adiffbc"
+path = "src/main.rs"
+
+[dependencies]
+adbc_core.workspace = true
+adbc_driver_manager.workspace = true
+arrow.workspace = true
+clap.workspace = true
+datafusion-differential-testing.workspace = true
+glob.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
