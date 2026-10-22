@@ -116,13 +116,66 @@ providers:
 ```
 
 ## Supported Generators
-Currently, only a hardcoded list of SQL queries exist. SQL is applied in order of `paths`.
+
+### Corpus
+A fixed list of SQL queries from files. SQL is applied in order of `paths`.
 ```yaml
 generators:
   - type: corpus
     paths:
       - queries/*.sql
 ```
+
+### Random
+A schema-aware generator. It reads the canonical dataset schema and emits valid
+`SELECT` statements: projections, `WHERE` filters, aggregates (including
+empty-projection `count(*)` / `count(1)`), and joins. Use it to find differences
+you did not write a query for.
+```yaml
+generators:
+  - type: random
+    seed: 12345   # optional; see modes below
+    count: 300    # number of queries to generate
+```
+
+The `seed` selects one of two modes:
+
+- **Seed given — reproducible and sound.** The same seed reproduces the same
+  queries. The generator suppresses shapes whose result is not a well-defined
+  function of the data: no `LIMIT` (which without a total order returns an
+  arbitrary subset) and no float-valued aggregates (`avg`, `sum` over floats)
+  whose last bits differ between engines. Every reported difference is a real
+  one.
+- **No seed — exploratory.** A fresh seed is chosen each run (so runs differ),
+  and `LIMIT` and float aggregates are also emitted. This reaches more query
+  shapes but can report differences that are legitimate engine non-determinism
+  rather than bugs — triage accordingly. The chosen seed is still recorded in
+  each finding's provenance, so a run can be reproduced after the fact by pinning
+  that seed.
+
+Generators can be combined; corpus queries run first, then generated queries.
+
+#### Feedback mutation
+Turn on `mutate_on_finding` to make the run dig around failures. When any query
+produces a finding, the generator mutates it into nearby variants (swap a
+comparison operator, perturb a literal, swap an aggregate, drop a `WHERE` /
+`ORDER BY`, tweak a `LIMIT`) and queues them, so mutants of mutants explore the
+neighborhood of a bug.
+```yaml
+generators:
+  - type: random
+    seed: 99
+    count: 20
+    mutate_on_finding: true      # default false
+    mutations_per_finding: 6     # default 4
+```
+Every mutant is re-parsed before it is queued, so only valid SQL runs; a mutant
+that is semantically invalid is simply rejected by the oracle and skipped.
+`campaign.max_queries` bounds the total work (initial + mutants), and
+`campaign.max_findings` still caps findings. In practice a handful of seed
+queries expand to cover many variations of each failure — for example, 20 seed
+queries with mutation on ran 160 queries and surfaced far more findings than the
+20 alone.
 
 ## Support Providers
 
@@ -171,3 +224,26 @@ variants:
       extensions:
         - type: federation
 ```
+
+## Using as a library
+
+`crates/core` (the `datafusion-differential-testing` crate) is usable directly,
+without the CLI or YAML. Build a `CampaignSpec`, then drive it with
+`CampaignRunner`. The runner exposes typed extension points:
+
+- `with_provider_registry` — register custom `TableProvider` sources.
+- `with_extension_registry` — register custom `SessionExtension`s.
+- `with_comparator` — supply a custom `Comparator`.
+- `with_generators` — plug in custom `QueryGenerator`s (the corpus, schema-aware
+  random, and mutation generators are ordinary `QueryGenerator` implementations).
+- `with_artifact_store` — redirect or discard artifacts (e.g.
+  `NullArtifactStore` to keep findings only in the returned `RunReport`).
+
+Generation flows through the `QueryGenerator` trait: each round the runner calls
+`generate` with a `GenerationContext` (remaining budget, dataset schema, and the
+previous round's findings) and executes the returned queries. A feedback
+generator such as mutation reacts to `GenerationContext::new_findings`.
+
+See `crates/core/tests/library_usage.rs` for a complete, dependency-light
+example that builds a campaign, plugs in a custom generator, and runs it with no
+on-disk artifacts.

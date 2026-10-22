@@ -433,14 +433,18 @@ fn sqlite_type(data_type: &DataType) -> std::result::Result<&'static str, &'stat
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Timestamp(_, _) => Ok("INTEGER"),
+        | DataType::UInt64 => Ok("INTEGER"),
         DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => {
             Ok("REAL")
         }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT"),
+        // SQLite has no native date/time type; store them as ISO-8601 TEXT so the
+        // provider's read decoder (which keys off TEXT storage) round-trips them.
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => Ok("TEXT"),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Ok("BLOB"),
         _ => Err("SQLite adapter does not support this Arrow type"),
     }
@@ -452,9 +456,14 @@ fn sql_literal(array: &dyn Array, row: usize) -> Result<String> {
     }
     let value = array_value_to_string(array, row)?;
     match array.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            Ok(format!("'{}'", value.replace('\'', "''")))
-        }
+        // Strings and date/time render as their textual form and must be quoted;
+        // an unquoted `2024-01-01` would be evaluated by SQLite as arithmetic.
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => Ok(format!("'{}'", value.replace('\'', "''"))),
         DataType::Boolean => Ok(if value == "true" { "1" } else { "0" }.to_owned()),
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Err(provider_message(
             "sqlite",
